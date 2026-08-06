@@ -217,7 +217,14 @@ def build_wifi_rollback_command(operation_id: str) -> str:
     )
 
 
-def build_wifi_apply_command(section: str, radio: str, country: str, operation_id: str) -> str:
+def build_wifi_apply_command(
+    section: str,
+    radio: str,
+    country: str,
+    operation_id: str,
+    *,
+    password_changed: bool,
+) -> str:
     section = _validate_uci_section(section, label="Wi‑Fi сети")
     radio = _validate_uci_section(radio, label="радиомодуля")
     operation_id = _validate_operation_id(operation_id)
@@ -225,11 +232,21 @@ def build_wifi_apply_command(section: str, radio: str, country: str, operation_i
     if country not in {"RU", "CN"}:
         raise SetupError("invalid_wifi_country", "Для автоматической настройки поддерживаются коды RU и CN.")
     del operation_id
-    return (
+    password_command = (
         "key=$(cat /tmp/kato-wifi-key); "
         f"uci set wireless.{section}.encryption='sae-mixed'; "
         f"uci set wireless.{section}.key=\"$key\"; "
-        f"uci set wireless.{radio}.country={shlex.quote(country)}; "
+        if password_changed
+        else ""
+    )
+    return (
+        "ssid=$(cat /tmp/kato-wifi-ssid); "
+        f"uci set wireless.{section}.device={shlex.quote(radio)}; "
+        f"uci set wireless.{section}.mode='ap'; "
+        f"uci set wireless.{section}.ssid=\"$ssid\"; "
+        + password_command
+        + f"uci set wireless.{radio}.disabled='0'; "
+        + f"uci set wireless.{radio}.country={shlex.quote(country)}; "
         "uci commit wireless; wifi reload >/dev/null 2>&1 || wifi"
     )
 
@@ -247,6 +264,7 @@ def build_wifi_create_command(radio: str, country: str, operation_id: str) -> st
         f"uci set wireless.{section}.mode='ap'; uci set wireless.{section}.network='lan'; "
         f"uci set wireless.{section}.ssid=\"$ssid\"; uci set wireless.{section}.encryption='sae-mixed'; "
         f"uci set wireless.{section}.key=\"$key\"; "
+        f"uci set wireless.{radio}.disabled='0'; "
         f"uci set wireless.{radio}.country={shlex.quote(country)}; "
         f"uci commit wireless; wifi reload >/dev/null 2>&1 || wifi; printf '%s' {shlex.quote(section)}"
     )
@@ -1283,15 +1301,16 @@ def change_wifi_configuration(
     session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    password = validate_wifi_password(password)
     radio = _validate_uci_section(radio, label="радиомодуля")
     country = str(country).upper()
     if country not in {"RU", "CN"}:
         raise SetupError("invalid_wifi_country", "Код страны Wi‑Fi должен быть RU или CN.")
     creating = section is None
-    if creating:
-        ssid = validate_wifi_ssid(ssid or "")
-    else:
+    password_changed = bool(password)
+    if creating or password_changed:
+        password = validate_wifi_password(password)
+    ssid = validate_wifi_ssid(ssid or "")
+    if not creating:
         section = _validate_uci_section(section or "", label="Wi‑Fi сети")
 
     session = _connect_pinned(spec, expected_fingerprint, session_factory)
@@ -1321,12 +1340,12 @@ def change_wifi_configuration(
             raise SetupError("wifi_rollback_unavailable", "Роутер не поддерживает безопасный таймер отката Wi‑Fi.")
         if capability.get("sae") != "1":
             raise SetupError("wifi_sae_unavailable", "Установленный Wi‑Fi модуль не подтвердил поддержку WPA2/WPA3 Mixed Mode.")
-        if section and (capability.get("mode") != "ap" or capability.get("device") != radio):
-            raise SetupError("wifi_target_changed", "Выбранная Wi‑Fi сеть больше не относится к указанному радиомодулю.")
+        if section and capability.get("mode") != "ap":
+            raise SetupError("wifi_target_changed", "Выбранная Wi‑Fi сеть больше не работает в режиме точки доступа.")
 
-        session.write_file("/tmp/kato-wifi-key", password.encode("utf-8"))
-        if creating and ssid is not None:
-            session.write_file("/tmp/kato-wifi-ssid", ssid.encode("utf-8"))
+        if password_changed:
+            session.write_file("/tmp/kato-wifi-key", password.encode("utf-8"))
+        session.write_file("/tmp/kato-wifi-ssid", ssid.encode("utf-8"))
         progress("rollback", "running", "Включаем автоматический откат через две минуты")
         session.run(build_wifi_rollback_command(operation_id), label="таймер отката Wi-Fi", timeout=20)
         progress("wifi", "running", "Применяем новые параметры Wi‑Fi. При необходимости подключитесь к сети заново")
@@ -1345,7 +1364,13 @@ def change_wifi_configuration(
             target_section = str(section)
             try:
                 session.run(
-                    build_wifi_apply_command(target_section, radio, country, operation_id),
+                    build_wifi_apply_command(
+                        target_section,
+                        radio,
+                        country,
+                        operation_id,
+                        password_changed=password_changed,
+                    ),
                     label="изменение Wi-Fi",
                     timeout=30,
                 )
@@ -1355,22 +1380,35 @@ def change_wifi_configuration(
     finally:
         session.close()
 
-    password_sha256 = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    ssid_sha256 = hashlib.sha256(ssid.encode("utf-8")).hexdigest()
+    password_sha256 = hashlib.sha256(password.encode("utf-8")).hexdigest() if password_changed else None
     verify_command = (
-        f"printf 'encryption=%s\\ncountry=%s\\n' \"$(uci -q get wireless.{target_section}.encryption)\" "
-        f"\"$(uci -q get wireless.{radio}.country)\"; key=$(uci -q get wireless.{target_section}.key); "
-        "printf '%s' \"$key\" | sha256sum | awk '{print \"key_sha256=\" $1}'; "
-        f"[ \"$(uci -q get wireless.{target_section}.mode)\" = ap ] && echo section=1 || echo section=0"
+        f"printf 'mode=%s\\ndevice=%s\\ncountry=%s\\n' \"$(uci -q get wireless.{target_section}.mode)\" "
+        f"\"$(uci -q get wireless.{target_section}.device)\" \"$(uci -q get wireless.{radio}.country)\"; "
+        f"[ \"$(uci -q get wireless.{radio}.disabled)\" = 1 ] && echo radio_enabled=0 || echo radio_enabled=1; "
+        f"ssid=$(uci -q get wireless.{target_section}.ssid); printf '%s' \"$ssid\" | sha256sum | "
+        "awk '{print \"ssid_sha256=\" $1}'; "
+        + (
+            f"printf 'encryption=%s\\n' \"$(uci -q get wireless.{target_section}.encryption)\"; "
+            f"key=$(uci -q get wireless.{target_section}.key); printf '%s' \"$key\" | sha256sum | "
+            "awk '{print \"key_sha256=\" $1}'"
+            if password_changed
+            else ""
+        )
     )
 
     def verified(value: str) -> bool:
         state = _simple_key_values(value)
-        return (
-            state.get("encryption") == "sae-mixed"
+        matches = (
+            state.get("mode") == "ap"
+            and state.get("device") == radio
             and state.get("country") == country
-            and state.get("key_sha256") == password_sha256
-            and state.get("section") == "1"
+            and state.get("radio_enabled") == "1"
+            and state.get("ssid_sha256") == ssid_sha256
         )
+        if password_changed:
+            matches = matches and state.get("encryption") == "sae-mixed" and state.get("key_sha256") == password_sha256
+        return matches
 
     progress("reconnect", "running", "Ожидаем переподключение и подтверждаем Wi‑Fi")
     confirmed_session = _wait_for_verified_router(
@@ -1390,10 +1428,12 @@ def change_wifi_configuration(
             confirmed_session.close()
         progress("reconnect", "done", "Wi‑Fi подтверждён, автоматический откат отменён")
         return {
-            "operation": "wifi_create" if creating else "wifi_password",
+            "operation": "wifi_create" if creating else "wifi_edit",
             "section": target_section,
-            "ssid": ssid if creating else None,
+            "ssid": ssid,
+            "radio": radio,
             "country": country,
+            "password_changed": password_changed,
         }
 
     rolled_back = _confirm_router_rollback(

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -104,6 +106,7 @@ class FakeControlSession:
                 "Package: luci-i18n-adblock-ru\nVersion: 25.300.1\nArchitecture: all"
                 if self.overrides.get("adblock_installed") else ""
             ),
+            "control-adblock-available": str(self.overrides.get("adblock_latest", "4.4.2-r1")),
             "control-mihomo-runtime": str(
                 self.overrides.get("mihomo_runtime", "Mihomo Meta v1.19.29 linux arm64")
             ),
@@ -126,7 +129,7 @@ class FakeControlSession:
                 {
                     "radio0": {
                         "up": True,
-                        "config": {"channel": "36", "band": "5g"},
+                        "config": {"channel": "36", "band": "5g", "country": "RU"},
                         "interfaces": [
                             {
                                 "section": "default_radio0",
@@ -134,11 +137,17 @@ class FakeControlSession:
                                     "mode": "ap",
                                     "ssid": "Kato Home",
                                     "encryption": "sae-mixed",
+                                    "key": "fixture-current-psk-must-not-escape",
                                     "network": ["lan"],
                                 },
                             }
                         ],
-                    }
+                    },
+                    "radio1": {
+                        "up": False,
+                        "config": {"channel": "auto", "band": "2g", "country": "CN"},
+                        "interfaces": [],
+                    },
                 }
             ),
             "control-backups": "20260803-100000-deadbeef\t1785740400\t640\t1",
@@ -182,7 +191,17 @@ class RouterControlTests(unittest.TestCase):
         self.assertTrue(report["connected"])
         self.assertTrue(report["internet"]["online"])
         self.assertEqual("Kato Home", report["wifi"][0]["ssid"])
+        self.assertEqual("radio0", report["wifi"][0]["radio"])
+        self.assertEqual("RU", report["wifi"][0]["country"])
         self.assertNotIn("key", report["wifi"][0])
+        self.assertEqual(
+            [
+                {"name": "radio0", "band": "5g", "country": "RU", "allowed_countries": ["RU", "CN"], "up": True},
+                {"name": "radio1", "band": "2g", "country": "CN", "allowed_countries": ["RU", "CN"], "up": False},
+            ],
+            report["wifi_radios"],
+        )
+        self.assertNotIn("fixture-current-psk-must-not-escape", json.dumps(report, ensure_ascii=False))
         self.assertEqual(3, report["subscription"]["servers"])
         self.assertEqual(2, report["subscription"]["locations"])
         self.assertEqual("https://subscribe.example.test/private-token", report["subscription"]["url"])
@@ -197,6 +216,42 @@ class RouterControlTests(unittest.TestCase):
         parsed = parse_public_ip_info('{"ip":"not-an-ip","country_code":"RU","org":"Example"}')
         self.assertFalse(parsed["available"])
         self.assertIsNone(parsed["ip"])
+
+    def test_public_ip_lookup_has_https_fallbacks_and_parses_their_provider_fields(self) -> None:
+        source = (TOOL_ROOT / "katovpn_router_setup" / "control.py").read_text(encoding="utf-8")
+        self.assertIn("https://ipapi.co/json/", source)
+        self.assertIn("https://ipwho.is/", source)
+        self.assertIn("https://ifconfig.co/json", source)
+
+        ipwho = parse_public_ip_info(
+            json.dumps(
+                {
+                    "ip": "203.0.113.43",
+                    "city": "Moscow",
+                    "region": "Moscow",
+                    "country_code": "RU",
+                    "country": "Russia",
+                    "connection": {"isp": "Fallback ISP"},
+                }
+            )
+        )
+        ifconfig = parse_public_ip_info(
+            json.dumps(
+                {
+                    "ip": "203.0.113.44",
+                    "city": "Moscow",
+                    "region_name": "Moscow",
+                    "country_iso": "RU",
+                    "country": "Russia",
+                    "asn_org": "Second ISP",
+                }
+            )
+        )
+
+        self.assertEqual("Fallback ISP", ipwho["provider"])
+        self.assertEqual("Second ISP", ifconfig["provider"])
+        self.assertEqual("RU", ifconfig["country_code"])
+        self.assertEqual("Moscow", ifconfig["region"])
 
     def test_subscription_expiry_uses_standard_userinfo_header(self) -> None:
         class Response:
@@ -320,6 +375,18 @@ class RouterControlTests(unittest.TestCase):
         self.assertTrue(large["components"]["adblock"]["eligible"])
         self.assertFalse(large["components"]["adblock"]["installed"])
         self.assertTrue(installed["components"]["adblock"]["installed"])
+        self.assertFalse(installed["components"]["adblock"]["partial"])
+
+    def test_adblock_reports_latest_version_and_available_updates(self) -> None:
+        current = self.inspect(memory_kb=512 * 1024, adblock_installed=True, adblock_latest="4.4.2-r1")
+        newer = self.inspect(memory_kb=512 * 1024, adblock_installed=True, adblock_latest="4.4.3-r1")
+
+        self.assertEqual("4.4.2-r1", current["components"]["adblock"]["latest"])
+        self.assertFalse(current["components"]["adblock"]["update_available"])
+        self.assertEqual("current", current["components"]["adblock"]["status"])
+        self.assertEqual("4.4.3-r1", newer["components"]["adblock"]["latest"])
+        self.assertTrue(newer["components"]["adblock"]["update_available"])
+        self.assertEqual("update_available", newer["components"]["adblock"]["status"])
 
     def test_wifi_actions_fail_closed_without_sae_mixed_support(self) -> None:
         report = self.inspect(wifi_sae=0)
@@ -352,6 +419,13 @@ class RouterControlTests(unittest.TestCase):
         self.assertIn('data-view="internet"', html)
         self.assertIn('data-view="firmware"', html)
         self.assertIn('data-view="logs"', html)
+        self.assertIn("Обслуживание", html)
+        self.assertIn('firmware: ["Возможности роутера", "Обслуживание"]', script)
+        internet_section = html.split('id="internet-section"', 1)[1].split('id="firmware-section"', 1)[0]
+        maintenance_section = html.split('id="firmware-section"', 1)[1].split('id="logs-section"', 1)[0]
+        self.assertNotIn('id="support-access"', internet_section)
+        self.assertIn('id="support-access"', maintenance_section)
+        self.assertLess(maintenance_section.index('id="support-access"'), maintenance_section.index('id="backup-button"'))
         self.assertIn('value="192.168.11.1"', html)
         self.assertIn("Введите данные вашего роутера", html)
         self.assertIn("@katovpnbot", html)
@@ -370,7 +444,7 @@ class RouterControlTests(unittest.TestCase):
         self.assertNotIn("WAN / DNS / HTTPS", html)
         self.assertNotIn("Пакетный менеджер", html)
         self.assertIn("Выгрузить логи", html)
-        self.assertEqual("0.4.2-preview", server_module.APP_VERSION)
+        self.assertEqual("0.4.3-preview", server_module.APP_VERSION)
         self.assertNotIn('id="server-count"', html)
         self.assertNotIn('id="location-count"', html)
         self.assertIn("Журнал VPN", html)
@@ -379,6 +453,22 @@ class RouterControlTests(unittest.TestCase):
         self.assertIn('id="router-password-form"', html)
         self.assertIn('item.status !== "block"', script)
         self.assertIn("formatRadioLabel", script)
+        self.assertIn("Разрешить подключение", html)
+        self.assertIn("Завершить доступ", html)
+        self.assertNotIn("Разрешить поддержку на 1 час", html + script)
+        self.assertNotIn("Отключить поддержку", html + script)
+        self.assertNotIn('component.installed ? "Актуально"', script)
+        self.assertNotIn('component.installed ? "Установлен" : "Установить"', script)
+        self.assertEqual(1, script.count('edit.textContent = "Изменить"'))
+        self.assertIn('openWifiDialog("edit", network)', script)
+        self.assertNotIn('openWifiDialog("change_password"', script)
+        self.assertNotIn('action === "change_password"', script)
+        self.assertNotIn("Сменить пароль ·", script)
+        self.assertIn('id="wifi-ssid-field" class="field"', html)
+        self.assertIn('id="wifi-radio-field" class="field"', html)
+        self.assertIn('id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password">', html)
+        self.assertIn("Оставьте поле пустым, чтобы сохранить текущий пароль", html)
+        self.assertIn('report.wifi_radios || []', script)
 
     def test_login_api_never_returns_the_router_password(self) -> None:
         original_inspect = server_module.inspect_router
@@ -426,6 +516,108 @@ class RouterControlTests(unittest.TestCase):
             self.assertIsNone(httpd.app_state.get_router_session())
         finally:
             server_module.inspect_router = original_inspect
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+            if thread is not None:
+                thread.join(timeout=2)
+
+    def test_wifi_edit_api_is_allowlisted_and_secret_free(self) -> None:
+        original_change_wifi = server_module.change_wifi_configuration
+        called: dict[str, object] = {}
+        replacement = "fixture-replacement-psk"
+
+        def fake_change_wifi(_spec: ConnectionSpec, _fingerprint: str, **kwargs: object) -> dict:
+            called.update(kwargs)
+            return {
+                "operation": "wifi_edit",
+                "section": kwargs["section"],
+                "ssid": kwargs["ssid"],
+                "radio": kwargs["radio"],
+                "country": kwargs["country"],
+                "password_changed": bool(kwargs["password"]),
+            }
+
+        server_module.change_wifi_configuration = fake_change_wifi
+        httpd = None
+        thread = None
+        try:
+            httpd, url = server_module.run_server(open_browser=False)
+            httpd.app_state.save_router_session(
+                self.spec,
+                "SHA256:control-test-router",
+                {
+                    "safety": {"wifi_changes_enabled": True, "wifi_create_enabled": True},
+                    "lan": {"recommended_country": "RU"},
+                    "wifi": [{"section": "default_radio0", "radio": "radio0", "ssid": "Kato Home"}],
+                    "wifi_radios": [
+                        {"name": "radio0", "allowed_countries": ["RU", "CN"]},
+                        {"name": "radio1", "allowed_countries": ["RU", "CN"]},
+                    ],
+                },
+            )
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            parsed = urllib.parse.urlsplit(url)
+            token = urllib.parse.parse_qs(parsed.query)["token"][0]
+            origin = f"http://{parsed.netloc}"
+
+            def post(payload: dict) -> dict:
+                request = urllib.request.Request(
+                    origin + "/api/router/wifi",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "X-Kato-Token": token, "Origin": origin},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            def get_job(job_id: str) -> dict:
+                request = urllib.request.Request(
+                    origin + f"/api/jobs/{job_id}",
+                    headers={"X-Kato-Token": token, "Origin": origin},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return json.loads(response.read().decode("utf-8"))["job"]
+
+            accepted = post(
+                {
+                    "confirmed": True,
+                    "action": "edit",
+                    "section": "default_radio0",
+                    "ssid": "Kato Edited",
+                    "radio": "radio1",
+                    "country": "CN",
+                    "password": replacement,
+                }
+            )
+            public_job = {}
+            for _ in range(50):
+                public_job = get_job(accepted["job_id"])
+                if public_job.get("status") in {"done", "failed"}:
+                    break
+                time.sleep(0.02)
+
+            self.assertEqual("default_radio0", called["section"])
+            self.assertEqual("Kato Edited", called["ssid"])
+            self.assertEqual("radio1", called["radio"])
+            self.assertEqual("CN", called["country"])
+            self.assertEqual(replacement, called["password"])
+            self.assertNotIn(replacement, json.dumps(accepted, ensure_ascii=False))
+            self.assertNotIn(replacement, json.dumps(public_job, ensure_ascii=False))
+            self.assertEqual("wifi_edit", public_job["result"]["operation"])
+
+            for rejected_payload, expected_code in (
+                ({"confirmed": True, "action": "change_password", "section": "default_radio0", "ssid": "Kato Edited", "radio": "radio1", "country": "CN", "password": ""}, "invalid_wifi_action"),
+                ({"confirmed": True, "action": "edit", "section": "unknown_network", "ssid": "Kato Edited", "radio": "radio1", "country": "CN", "password": ""}, "invalid_wifi_section"),
+                ({"confirmed": True, "action": "edit", "section": "default_radio0", "ssid": "Kato Edited", "radio": "radio9", "country": "CN", "password": ""}, "invalid_wifi_radio"),
+            ):
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    post(rejected_payload)
+                error_payload = json.loads(rejected.exception.read().decode("utf-8"))
+                self.assertEqual(expected_code, error_payload["error"]["code"])
+        finally:
+            server_module.change_wifi_configuration = original_change_wifi
             if httpd is not None:
                 httpd.shutdown()
                 httpd.server_close()

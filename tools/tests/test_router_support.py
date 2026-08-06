@@ -183,6 +183,136 @@ class RouterSupportTests(unittest.TestCase):
         self.assertIn("no-port-forwarding", written)
         self.assertNotIn(self.spec.password, written + "".join(sessions[0].commands))
 
+    def test_router_capability_error_identifies_only_missing_safe_prerequisites(self) -> None:
+        class MissingTimeoutRouterSession:
+            def __init__(self, _spec: ConnectionSpec) -> None:
+                self.fingerprint = "SHA256:router"
+
+            def connect(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                del label, timeout, check
+                if "printf 'uid=%s" in command:
+                    return (
+                        "uid=0\ndropbear=1\ncron=1\ncron_enabled=1\n"
+                        f"daemon=1\ntimeout=0\nnow={int(time.time())}"
+                    )
+                return ""
+
+        with self.assertRaises(SetupError) as caught:
+            install_temporary_support_key(
+                self.spec,
+                "SHA256:router",
+                SUPPORT_KEY,
+                "session-12345678",
+                int(time.time()) + 3600,
+                session_factory=MissingTimeoutRouterSession,
+            )
+
+        error = caught.exception
+        self.assertEqual("support_router_unsupported", error.code)
+        self.assertEqual(["timeout"], error.details["missing_capabilities"])
+        self.assertIn("timeout", error.message)
+        self.assertNotIn(self.spec.password, json.dumps(error.as_dict(), ensure_ascii=False))
+
+    def test_router_key_install_accepts_busybox_timeout_applet_without_path_alias(self) -> None:
+        class BusyBoxTimeoutRouterSession:
+            def __init__(self, _spec: ConnectionSpec) -> None:
+                self.fingerprint = "SHA256:router"
+                self.commands: list[str] = []
+
+            def connect(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+            def write_file(self, _path: str, _data: bytes, mode: str = "600") -> None:
+                del mode
+
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                del label, timeout, check
+                self.commands.append(command)
+                if "printf 'uid=%s" in command:
+                    return (
+                        "uid=0\ndropbear=1\ncron=1\ncron_enabled=1\n"
+                        f"daemon=1\ntimeout=busybox\nnow={int(time.time())}"
+                    )
+                if "grep -F -c" in command:
+                    return "1"
+                return ""
+
+        sessions: list[BusyBoxTimeoutRouterSession] = []
+
+        def factory(spec: ConnectionSpec) -> BusyBoxTimeoutRouterSession:
+            session = BusyBoxTimeoutRouterSession(spec)
+            sessions.append(session)
+            return session
+
+        install_temporary_support_key(
+            self.spec,
+            "SHA256:router",
+            SUPPORT_KEY,
+            "session-12345678",
+            int(time.time()) + 3600,
+            session_factory=factory,
+        )
+
+        self.assertTrue(any("busybox timeout -s KILL" in command for command in sessions[0].commands))
+
+    def test_router_key_install_uses_pid_safe_shell_watchdog_when_timeout_is_absent(self) -> None:
+        class ShellWatchdogRouterSession:
+            def __init__(self, _spec: ConnectionSpec) -> None:
+                self.fingerprint = "SHA256:router"
+                self.commands: list[str] = []
+
+            def connect(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+            def write_file(self, _path: str, _data: bytes, mode: str = "600") -> None:
+                del mode
+
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                del label, timeout, check
+                self.commands.append(command)
+                if "printf 'uid=%s" in command:
+                    return (
+                        "uid=0\ndropbear=1\ncron=1\ncron_enabled=1\n"
+                        f"daemon=1\ntimeout=0\nwatchdog=1\nnow={int(time.time())}"
+                    )
+                if "grep -F -c" in command:
+                    return "1"
+                return ""
+
+        sessions: list[ShellWatchdogRouterSession] = []
+
+        def factory(spec: ConnectionSpec) -> ShellWatchdogRouterSession:
+            session = ShellWatchdogRouterSession(spec)
+            sessions.append(session)
+            return session
+
+        install_temporary_support_key(
+            self.spec,
+            "SHA256:router",
+            SUPPORT_KEY,
+            "session-12345678",
+            int(time.time()) + 3600,
+            session_factory=factory,
+        )
+
+        install_command = "".join(sessions[0].commands)
+        self.assertIn("KATO_SUPPORT_WATCHDOG", install_command)
+        self.assertIn("/proc/$SESSION_PID/stat", install_command)
+        self.assertIn('"$CURRENT_START" = "$SESSION_START"', install_command)
+        self.assertIn('kill -KILL "$SESSION_PID"', install_command)
+
     def test_manager_starts_and_stops_without_exposing_secrets(self) -> None:
         relay = FakeRelay()
         tunnel = FakeTunnel()
@@ -279,7 +409,8 @@ class RouterSupportTests(unittest.TestCase):
         self.assertIn('id="support-start-button"', html)
         self.assertIn('id="support-stop-button"', html)
         self.assertIn('id="support-copy-button"', html)
-        self.assertIn("Разрешить поддержку на 1 час", html)
+        self.assertIn("Разрешить подключение", html)
+        self.assertIn("Завершить доступ", html)
         self.assertIn("пароль роутера не передаётся", html)
         self.assertIn("При отключении, закрытии программы или окончании часа", html)
         self.assertIn("/api/support/start", script)

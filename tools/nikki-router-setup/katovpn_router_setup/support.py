@@ -151,10 +151,43 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
         "NOW=$(date +%s 2>/dev/null || printf '0')\n"
         "REMAINING=$((EXPIRES - NOW))\n"
         "[ \"$REMAINING\" -gt 0 ] || exit 124\n"
+        "KATO_SUPPORT_WATCHDOG=1\n"
+        "start_session_watchdog() {\n"
+        "  SESSION_PID=$$\n"
+        "  SESSION_START=$(awk '{print $22}' \"/proc/$SESSION_PID/stat\" 2>/dev/null)\n"
+        "  [ -n \"$SESSION_START\" ] || exit 125\n"
+        "  (\n"
+        "    while :; do\n"
+        "      NOW=$(date +%s 2>/dev/null || printf '0')\n"
+        "      WAIT=$((EXPIRES - NOW))\n"
+        "      [ \"$WAIT\" -gt 0 ] || break\n"
+        "      [ \"$WAIT\" -le 5 ] || WAIT=5\n"
+        "      sleep \"$WAIT\" || exit 0\n"
+        "      CURRENT_START=$(awk '{print $22}' \"/proc/$SESSION_PID/stat\" 2>/dev/null)\n"
+        "      [ \"$CURRENT_START\" = \"$SESSION_START\" ] || exit 0\n"
+        "    done\n"
+        "    CURRENT_START=$(awk '{print $22}' \"/proc/$SESSION_PID/stat\" 2>/dev/null)\n"
+        "    [ \"$CURRENT_START\" = \"$SESSION_START\" ] && kill -KILL \"$SESSION_PID\"\n"
+        "  ) >/dev/null 2>&1 &\n"
+        "}\n"
         "if [ -n \"${SSH_ORIGINAL_COMMAND:-}\" ]; then\n"
-        "  exec timeout -s KILL \"$REMAINING\" /bin/ash -c \"$SSH_ORIGINAL_COMMAND\"\n"
+        "  if command -v timeout >/dev/null 2>&1; then\n"
+        "    exec timeout -s KILL \"$REMAINING\" /bin/ash -c \"$SSH_ORIGINAL_COMMAND\"\n"
+        "  fi\n"
+        "  if busybox --list 2>/dev/null | grep -qx timeout; then\n"
+        "    exec busybox timeout -s KILL \"$REMAINING\" /bin/ash -c \"$SSH_ORIGINAL_COMMAND\"\n"
+        "  fi\n"
+        "  start_session_watchdog\n"
+        "  exec /bin/ash -c \"$SSH_ORIGINAL_COMMAND\"\n"
         "fi\n"
-        "exec timeout -s KILL \"$REMAINING\" /bin/ash -l\n"
+        "if command -v timeout >/dev/null 2>&1; then\n"
+        "  exec timeout -s KILL \"$REMAINING\" /bin/ash -l\n"
+        "fi\n"
+        "if busybox --list 2>/dev/null | grep -qx timeout; then\n"
+        "  exec busybox timeout -s KILL \"$REMAINING\" /bin/ash -l\n"
+        "fi\n"
+        "start_session_watchdog\n"
+        "exec /bin/ash -l\n"
         "KATO_SUPPORT_SESSION\n"
         f"chmod 700 {shlex.quote(session_shell)}; "
         f"touch {shlex.quote(SUPPORT_AUTHORIZED_KEYS)} {shlex.quote(SUPPORT_CRONTAB)}; "
@@ -232,15 +265,26 @@ def install_temporary_support_key(
             "printf 'cron=%s\\n' \"$([ -x /etc/init.d/cron ] && echo 1 || echo 0)\"; "
             "printf 'cron_enabled=%s\\n' \"$(ls /etc/rc.d/S*cron >/dev/null 2>&1 && echo 1 || echo 0)\"; "
             "printf 'daemon=%s\\n' \"$(command -v start-stop-daemon >/dev/null 2>&1 && echo 1 || echo 0)\"; "
-            "printf 'timeout=%s\\n' \"$(command -v timeout >/dev/null 2>&1 && echo 1 || echo 0)\"; "
+            "printf 'timeout=%s\\n' \"$(if command -v timeout >/dev/null 2>&1; then echo direct; "
+            "elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx timeout; "
+            "then echo busybox; else echo 0; fi)\"; "
+            "printf 'watchdog=%s\\n' \"$(if [ -r /proc/$$/stat ] && command -v date >/dev/null 2>&1 "
+            "&& command -v awk >/dev/null 2>&1 && command -v sleep >/dev/null 2>&1 "
+            "&& command -v kill >/dev/null 2>&1; then echo 1; else echo 0; fi)\"; "
             "printf 'now=%s\\n' \"$(date +%s 2>/dev/null || printf '0')\"",
             label="проверка временного доступа",
         )
-        required = {"uid=0", "dropbear=1", "cron=1", "cron_enabled=1", "daemon=1", "timeout=1"}
-        if not required.issubset(set(capabilities.splitlines())):
+        required = ("uid=0", "dropbear=1", "cron=1", "cron_enabled=1", "daemon=1")
+        capability_lines = set(capabilities.splitlines())
+        missing_capabilities = [item.split("=", 1)[0] for item in required if item not in capability_lines]
+        if not {"timeout=direct", "timeout=busybox", "timeout=1", "watchdog=1"}.intersection(capability_lines):
+            missing_capabilities.append("timeout")
+        if missing_capabilities:
             raise SetupError(
                 "support_router_unsupported",
-                "Роутер не подтвердил безопасное добавление и автоматическое удаление временного ключа.",
+                "Роутер не подтвердил безопасное добавление и автоматическое удаление временного ключа. "
+                f"Недоступно: {', '.join(missing_capabilities)}.",
+                {"missing_capabilities": missing_capabilities},
             )
         clock_match = re.search(r"(?m)^now=(\d+)$", capabilities)
         router_now = int(clock_match.group(1)) if clock_match else 0

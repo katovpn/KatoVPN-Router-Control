@@ -53,7 +53,7 @@
       <nav aria-label="Разделы">
         <button class="nav-item active" type="button" data-view="home" aria-current="page"><span class="nav-icon">⌂</span><span>Главная</span></button>
         <button class="nav-item" type="button" data-view="internet"><span class="nav-icon">⌁</span><span>Интернет</span></button>
-        <button class="nav-item" type="button" data-view="firmware"><span class="nav-icon">◇</span><span>Прошивка</span></button>
+        <button class="nav-item" type="button" data-view="firmware"><span class="nav-icon">◇</span><span>Обслуживание</span></button>
         <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">≡</span><span>Логи</span></button>
       </nav>
       <div class="sidebar-footer">
@@ -94,7 +94,7 @@
           <div class="section-block subscription-summary">
             <div class="block-heading"><div><p class="eyebrow">VPN</p><h2>VPN-подписка</h2></div><span id="subscription-state" class="label">Не установлена</span></div>
             <div class="detail-line"><span>Действует до</span><strong id="subscription-expiry">Срок не указан</strong></div>
-            <p id="subscription-note" class="muted">Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Прошивка».</p>
+            <p id="subscription-note" class="muted">Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Обслуживание».</p>
           </div>
           <div class="section-block support-block">
             <div class="block-heading"><div><p class="eyebrow">На связи</p><h2>Помощь KatoVPN</h2></div></div>
@@ -133,6 +133,24 @@
           </div>
         </div>
 
+      </section>
+
+      <section id="firmware-section" class="view-section" data-section="firmware">
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Возможности роутера</p><h2>Установленные модули</h2></div><p>VPN и защита управляются отдельно.</p></div>
+          <div id="component-list" class="component-list"></div>
+          <div id="install-readiness" class="install-readiness"></div>
+        </div>
+
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Профиль KatoVPN</p><h2>VPN-подписка</h2></div><span id="subscription-profile-state" class="label">Не установлена</span></div>
+          <form id="subscription-form" class="inline-form">
+            <label class="field"><span>Ссылка из личного кабинета</span><input id="subscription-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
+            <button id="subscription-button" class="button primary" type="submit"><span>Установить или обновить</span><b>→</b></button>
+          </form>
+          <p id="subscription-action-note" class="muted">Если VPN-модули ещё не установлены, ссылка сохранится в текущей сессии и будет использована при установке.</p>
+        </div>
+
         <div id="support-access" class="section-block support-access">
           <div class="block-heading">
             <div><p class="eyebrow">Удалённая помощь</p><h2>Временный доступ для поддержки</h2></div>
@@ -144,7 +162,7 @@
               <strong>Только SSH роутера и только на один час</strong>
               <p id="support-availability-note" class="muted">Приложение создаст исходящее защищённое подключение к закрытому серверу KatoVPN.</p>
             </div>
-            <button id="support-start-button" class="button primary" type="button"><span>Разрешить поддержку на 1 час</span><b>→</b></button>
+            <button id="support-start-button" class="button primary" type="button"><span>Разрешить подключение</span><b>→</b></button>
           </div>
 
           <div id="support-active" class="support-active hidden">
@@ -162,28 +180,11 @@
             </div>
             <div class="support-actions">
               <button id="support-copy-button" class="button secondary" type="button"><span>Скопировать для поддержки</span><b>□</b></button>
-              <button id="support-stop-button" class="button danger-button" type="button"><span>Отключить поддержку</span></button>
+              <button id="support-stop-button" class="button danger-button" type="button"><span>Завершить доступ</span></button>
             </div>
           </div>
 
           <p class="safety-copy support-safety">Роутер не открывается напрямую в интернет. Приложение передаёт только SSH-соединение к роутеру через закрытый сервер KatoVPN, а пароль роутера не передаётся. Добавляется отдельный временный ключ. При отключении, закрытии программы или окончании часа туннель закрывается, а ключ удаляется. На роутер не устанавливаются NetBird, Tailscale или другие постоянные программы.</p>
-        </div>
-      </section>
-
-      <section id="firmware-section" class="view-section" data-section="firmware">
-        <div class="section-block">
-          <div class="block-heading"><div><p class="eyebrow">Возможности роутера</p><h2>Установленные модули</h2></div><p>VPN и защита управляются отдельно.</p></div>
-          <div id="component-list" class="component-list"></div>
-          <div id="install-readiness" class="install-readiness"></div>
-        </div>
-
-        <div class="section-block">
-          <div class="block-heading"><div><p class="eyebrow">Профиль KatoVPN</p><h2>VPN-подписка</h2></div><span id="subscription-profile-state" class="label">Не установлена</span></div>
-          <form id="subscription-form" class="inline-form">
-            <label class="field"><span>Ссылка из личного кабинета</span><input id="subscription-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
-            <button id="subscription-button" class="button primary" type="submit"><span>Установить или обновить</span><b>→</b></button>
-          </form>
-          <p id="subscription-action-note" class="muted">Если VPN-модули ещё не установлены, ссылка сохранится в текущей сессии и будет использована при установке.</p>
         </div>
 
         <div class="section-block">
@@ -219,13 +220,13 @@
     <form id="wifi-form" method="dialog">
       <button class="dialog-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
       <p id="wifi-dialog-eyebrow" class="eyebrow">Wi‑Fi</p>
-      <h2 id="wifi-dialog-title">Сменить пароль</h2>
-      <p id="wifi-dialog-copy" class="muted">После применения подключитесь к сети с новым паролем. На подтверждение будет две минуты.</p>
-      <input id="wifi-action" type="hidden" value="change_password">
+      <h2 id="wifi-dialog-title">Изменить Wi‑Fi</h2>
+      <p id="wifi-dialog-copy" class="muted">Можно изменить название, пароль, радиомодуль и код страны.</p>
+      <input id="wifi-action" type="hidden" value="edit">
       <input id="wifi-section" type="hidden">
       <label id="wifi-radio-field" class="field"><span>Радиомодуль</span><select id="wifi-radio"></select></label>
-      <label id="wifi-ssid-field" class="field hidden"><span>Название сети</span><input id="wifi-ssid" type="text" maxlength="32" autocomplete="off"></label>
-      <label class="field"><span>Новый пароль</span><input id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password" required></label>
+      <label id="wifi-ssid-field" class="field"><span>Название сети</span><input id="wifi-ssid" type="text" maxlength="32" autocomplete="off" required></label>
+      <label class="field"><span>Новый пароль</span><input id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password"><small class="muted">Оставьте поле пустым, чтобы сохранить текущий пароль.</small></label>
       <label class="field"><span>Код страны</span><select id="wifi-country"><option value="RU">RU — Россия</option><option value="CN">CN — Китай</option></select></label>
       <button id="wifi-submit" class="button primary" type="submit"><span>Применить безопасно</span><b>→</b></button>
     </form>
