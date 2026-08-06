@@ -75,7 +75,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: dist/KatoVPN-Router-Control-v*.exe
-          sbom-path: dist/KatoVPN-Router-Control-v*.cdx.json
+          sbom-path: dist/KatoVPN-Router-Control-${{ github.ref_name }}.cdx.json
 
       - name: Publish GitHub pre-release
         shell: pwsh
