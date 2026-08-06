@@ -61,7 +61,7 @@ jobs:
           if ($executables.Count -ne 1) { throw "Expected one release executable, found $($executables.Count)." }
           $exe = $executables[0]
           $sbom = Join-Path $exe.DirectoryName "$($exe.BaseName).cdx.json"
-          cyclonedx-py requirements tools/nikki-router-setup/requirements.txt --output-reproducible --output-format JSON --output-file $sbom
+          cyclonedx-py requirements tools/nikki-router-setup/requirements.txt --output-format JSON --output-file $sbom
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $hash = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $($exe.Name)" | Set-Content -LiteralPath (Join-Path $exe.DirectoryName 'SHA256SUMS.txt') -Encoding ascii
