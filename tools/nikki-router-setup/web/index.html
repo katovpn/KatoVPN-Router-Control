@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>KatoVPN · Router Control</title>
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <section id="login-view" class="login-view">
+    <div class="login-panel">
+      <div class="login-brand">
+        <img src="logo.png" alt="">
+        <div><strong>KatoVPN</strong><span>Router Control</span></div>
+      </div>
+      <p class="eyebrow">Ваш роутер</p>
+      <h1>Подключение</h1>
+      <p class="login-copy">Введите данные вашего роутера, чтобы проверить или настроить работу VPN.</p>
+
+      <form id="login-form" novalidate>
+        <label class="field field-address">
+          <span>IP или имя роутера</span>
+          <input id="host" name="host" type="text" value="192.168.11.1" inputmode="url" spellcheck="false" required>
+        </label>
+        <label class="field field-port">
+          <span>SSH-порт</span>
+          <input id="port" name="port" type="number" value="22" min="1" max="65535" required>
+        </label>
+        <label class="field username-field">
+          <span>Логин</span>
+          <input id="username" name="username" type="text" value="root" autocomplete="username" spellcheck="false" required>
+        </label>
+        <label class="field password-field">
+          <span>Пароль</span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <button id="toggle-password" class="reveal" type="button">Показать</button>
+        </label>
+        <button id="login-button" class="button primary login-button" type="submit"><span>Подключиться</span><b>→</b></button>
+      </form>
+
+      <p class="privacy-note"><i></i> Пароль хранится только в памяти приложения до выхода или закрытия последней вкладки.</p>
+      <div class="minimums"><span>OpenWrt 24.10+</span><span>RAM от 200 МБ</span><span>SSH-доступ</span></div>
+    </div>
+  </section>
+
+  <div id="app-view" class="app-view hidden">
+    <aside class="sidebar">
+      <a class="app-brand" href="#home" data-view="home" aria-label="KatoVPN — Главная">
+        <img src="logo.png" alt=""><span><strong>KatoVPN</strong><small>Router Control</small></span>
+      </a>
+      <nav aria-label="Разделы">
+        <button class="nav-item active" type="button" data-view="home" aria-current="page"><span class="nav-icon">⌂</span><span>Главная</span></button>
+        <button class="nav-item" type="button" data-view="internet"><span class="nav-icon">⌁</span><span>Интернет</span></button>
+        <button class="nav-item" type="button" data-view="firmware"><span class="nav-icon">◇</span><span>Прошивка</span></button>
+        <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">≡</span><span>Логи</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="router-mini"><i id="sidebar-dot"></i><span><strong id="sidebar-router">Роутер</strong><small id="sidebar-address">—</small></span></div>
+        <button id="logout-button" class="text-button" type="button">Выйти</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="content-header">
+        <div><p id="section-eyebrow" class="eyebrow">Обзор системы</p><h1 id="section-title">Главная</h1></div>
+        <div class="header-actions">
+          <span id="internet-pill" class="status-pill pending"><i></i><span>Проверка интернета</span></span>
+          <button id="refresh-button" class="icon-button" type="button" aria-label="Обновить сведения">↻</button>
+        </div>
+      </header>
+
+      <section id="home-section" class="view-section active" data-section="home">
+        <div class="hero-status">
+          <div><span class="kicker">Состояние роутера</span><h2 id="router-model">Подключено</h2><p id="router-firmware">Получаем сведения…</p></div>
+          <div id="readiness-seal" class="readiness-seal"><span>—</span><small>готовность</small></div>
+        </div>
+
+        <div class="dashboard-grid">
+          <div class="section-block dashboard-card">
+            <div class="block-heading"><div><p class="eyebrow">Минимальная проверка</p><h2>Совместимость</h2></div></div>
+            <div id="compatibility-list" class="status-list compact"></div>
+          </div>
+          <div class="section-block dashboard-card ip-card">
+            <div class="block-heading"><div><p class="eyebrow">Выход в интернет</p><h2>IP-адрес</h2></div><span id="public-ip-flag" class="country-flag">—</span></div>
+            <strong id="public-ip-address" class="primary-metric">Определяем…</strong>
+            <p id="public-ip-location" class="muted">Приблизительное местоположение</p>
+            <div class="detail-line"><span>Провайдер</span><strong id="public-ip-provider">—</strong></div>
+          </div>
+        </div>
+
+        <div class="split-layout">
+          <div class="section-block subscription-summary">
+            <div class="block-heading"><div><p class="eyebrow">VPN</p><h2>VPN-подписка</h2></div><span id="subscription-state" class="label">Не установлена</span></div>
+            <div class="detail-line"><span>Действует до</span><strong id="subscription-expiry">Срок не указан</strong></div>
+            <p id="subscription-note" class="muted">Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Прошивка».</p>
+          </div>
+          <div class="section-block support-block">
+            <div class="block-heading"><div><p class="eyebrow">На связи</p><h2>Помощь KatoVPN</h2></div></div>
+            <a href="https://t.me/katovpnbot" target="_blank" rel="noreferrer"><span>Telegram-бот</span><strong>@katovpnbot ↗</strong></a>
+            <a href="https://katovpn.app" target="_blank" rel="noreferrer"><span>Личный кабинет</span><strong>katovpn.app ↗</strong></a>
+            <a href="https://t.me/katovpn_help" target="_blank" rel="noreferrer"><span>Техническая поддержка</span><strong>@katovpn_help ↗</strong></a>
+          </div>
+        </div>
+      </section>
+
+      <section id="internet-section" class="view-section" data-section="internet">
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Беспроводная сеть</p><h2>Wi‑Fi</h2></div><button id="create-wifi-button" class="button secondary" type="button">Создать сеть</button></div>
+          <div id="wifi-list" class="wifi-list"></div>
+          <p class="safety-copy">Перед изменением приложение включает двухминутный откат. Если новый пароль не подтвердится, роутер вернёт прежние настройки.</p>
+        </div>
+
+        <div class="network-settings-grid">
+          <div class="section-block lan-card">
+            <div class="block-heading"><div><p class="eyebrow">Домашняя сеть</p><h2>Локальный IP роутера</h2></div><span id="lan-state" class="label">Статический</span></div>
+            <form id="lan-form" class="stack-form">
+              <label class="field"><span>IPv4-адрес</span><input id="lan-ip" type="text" inputmode="decimal" placeholder="192.168.11.1" spellcheck="false"></label>
+              <button id="lan-button" class="button primary" type="submit"><span>Изменить адрес</span><b>→</b></button>
+            </form>
+            <p class="safety-copy">Без подтверждения по новому адресу роутер автоматически вернёт старый IP.</p>
+          </div>
+
+          <div class="section-block password-card">
+            <div class="block-heading"><div><p class="eyebrow">Доступ к роутеру</p><h2>Пароль администратора</h2></div><span class="label">SSH / OpenWrt</span></div>
+            <form id="router-password-form" class="stack-form">
+              <label class="field"><span>Новый пароль</span><input id="router-new-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label>
+              <label class="field"><span>Повторите пароль</span><input id="router-confirm-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label>
+              <button id="router-password-button" class="button primary" type="submit"><span>Сменить пароль</span><b>→</b></button>
+            </form>
+            <p class="safety-copy">Приложение проверит вход с новым паролем. Если проверка не пройдёт, через две минуты вернётся прежний.</p>
+          </div>
+        </div>
+
+        <div id="support-access" class="section-block support-access">
+          <div class="block-heading">
+            <div><p class="eyebrow">Удалённая помощь</p><h2>Временный доступ для поддержки</h2></div>
+            <span id="support-state" class="label">Отключён</span>
+          </div>
+
+          <div id="support-idle" class="support-idle">
+            <div>
+              <strong>Только SSH роутера и только на один час</strong>
+              <p id="support-availability-note" class="muted">Приложение создаст исходящее защищённое подключение к закрытому серверу KatoVPN.</p>
+            </div>
+            <button id="support-start-button" class="button primary" type="button"><span>Разрешить поддержку на 1 час</span><b>→</b></button>
+          </div>
+
+          <div id="support-active" class="support-active hidden">
+            <div class="support-active-head">
+              <div><span>Поддержка подключена</span><strong id="support-countdown">01:00:00</strong></div>
+              <small>Осталось времени</small>
+            </div>
+            <p class="support-share-note">Передайте эти данные сотруднику поддержки KatoVPN:</p>
+            <div class="support-details">
+              <div><span>Код подключения</span><strong id="support-code">—</strong></div>
+              <div><span>Сервер</span><strong id="support-server">—</strong></div>
+              <div><span>Порт</span><strong id="support-port">—</strong></div>
+              <div><span>Логин роутера</span><strong id="support-router-login">root</strong></div>
+              <div class="support-expiry"><span>Доступ действует до</span><strong id="support-expiry">—</strong></div>
+            </div>
+            <div class="support-actions">
+              <button id="support-copy-button" class="button secondary" type="button"><span>Скопировать для поддержки</span><b>□</b></button>
+              <button id="support-stop-button" class="button danger-button" type="button"><span>Отключить поддержку</span></button>
+            </div>
+          </div>
+
+          <p class="safety-copy support-safety">Роутер не открывается напрямую в интернет. Приложение передаёт только SSH-соединение к роутеру через закрытый сервер KatoVPN, а пароль роутера не передаётся. Добавляется отдельный временный ключ. При отключении, закрытии программы или окончании часа туннель закрывается, а ключ удаляется. На роутер не устанавливаются NetBird, Tailscale или другие постоянные программы.</p>
+        </div>
+      </section>
+
+      <section id="firmware-section" class="view-section" data-section="firmware">
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Возможности роутера</p><h2>Установленные модули</h2></div><p>VPN и защита управляются отдельно.</p></div>
+          <div id="component-list" class="component-list"></div>
+          <div id="install-readiness" class="install-readiness"></div>
+        </div>
+
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Профиль KatoVPN</p><h2>VPN-подписка</h2></div><span id="subscription-profile-state" class="label">Не установлена</span></div>
+          <form id="subscription-form" class="inline-form">
+            <label class="field"><span>Ссылка из личного кабинета</span><input id="subscription-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
+            <button id="subscription-button" class="button primary" type="submit"><span>Установить или обновить</span><b>→</b></button>
+          </form>
+          <p id="subscription-action-note" class="muted">Если VPN-модули ещё не установлены, ссылка сохранится в текущей сессии и будет использована при установке.</p>
+        </div>
+
+        <div class="section-block">
+          <div class="block-heading"><div><p class="eyebrow">Точка восстановления</p><h2>Резервные копии</h2></div><button id="backup-button" class="button secondary" type="button">Создать копию</button></div>
+          <div id="backup-list" class="backup-list"></div>
+          <p class="safety-copy">Копия сохраняет настройки VPN, подписки и mixin. Она не переустанавливает удалённые пакеты и ядро.</p>
+        </div>
+      </section>
+
+      <section id="logs-section" class="view-section" data-section="logs">
+        <div class="logs-grid">
+          <div class="section-block log-card">
+            <p class="eyebrow">Подключения и работа VPN</p>
+            <h2>Журнал VPN</h2>
+            <p class="muted">В один файл попадут журнал работы Nikki, журнал соединений Mihomo и системные события OpenWrt.</p>
+            <label class="field select-field"><span>Объём</span><select id="log-lines"><option value="300">300 строк</option><option value="500" selected>500 строк</option><option value="1000">1000 строк</option><option value="2000">2000 строк</option></select></label>
+            <p class="log-scope-note">Количество означает последние строки из каждого источника. Например, 500 — до 500 строк Nikki, 500 строк Mihomo и 500 строк OpenWrt.</p>
+            <button class="button primary log-download" type="button" data-log-kind="connections"><span>Выгрузить логи</span><b>↓</b></button>
+          </div>
+          <div class="section-block log-card">
+            <p class="eyebrow">Диагностика</p>
+            <h2>Полный debug-отчёт</h2>
+            <p class="muted">Система, версии, состояние сервиса и правила маршрутизации. Ссылки, пароли и ключи удаляются перед скачиванием.</p>
+            <button class="button secondary log-download" type="button" data-log-kind="debug"><span>Сформировать debug.txt</span><b>↓</b></button>
+          </div>
+        </div>
+        <div class="section-block privacy-card"><strong>Безопасная выгрузка</strong><p>Файл создаётся локально в браузере и не отправляется в KatoVPN. Перед передачей в поддержку всё равно просмотрите его.</p></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="wifi-dialog" class="action-dialog">
+    <form id="wifi-form" method="dialog">
+      <button class="dialog-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+      <p id="wifi-dialog-eyebrow" class="eyebrow">Wi‑Fi</p>
+      <h2 id="wifi-dialog-title">Сменить пароль</h2>
+      <p id="wifi-dialog-copy" class="muted">После применения подключитесь к сети с новым паролем. На подтверждение будет две минуты.</p>
+      <input id="wifi-action" type="hidden" value="change_password">
+      <input id="wifi-section" type="hidden">
+      <label id="wifi-radio-field" class="field"><span>Радиомодуль</span><select id="wifi-radio"></select></label>
+      <label id="wifi-ssid-field" class="field hidden"><span>Название сети</span><input id="wifi-ssid" type="text" maxlength="32" autocomplete="off"></label>
+      <label class="field"><span>Новый пароль</span><input id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password" required></label>
+      <label class="field"><span>Код страны</span><select id="wifi-country"><option value="RU">RU — Россия</option><option value="CN">CN — Китай</option></select></label>
+      <button id="wifi-submit" class="button primary" type="submit"><span>Применить безопасно</span><b>→</b></button>
+    </form>
+  </dialog>
+
+  <aside id="operation-panel" class="operation-panel hidden" aria-live="polite">
+    <button id="operation-close" class="panel-close" type="button" aria-label="Закрыть">×</button>
+    <p id="operation-kicker" class="eyebrow">Операция</p>
+    <h2 id="operation-title">Выполняется</h2>
+    <p id="operation-message" class="muted">Не закрывайте приложение.</p>
+    <ol id="operation-steps" class="operation-steps"></ol>
+  </aside>
+
+  <div id="error-banner" class="error-banner hidden" role="alert"><strong>Не удалось выполнить действие</strong><span id="error-message"></span></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "api_url": "https://router-support.katovpn.app/v1",
+  "relay_host_key_sha256": "SHA256:JJKGuJyodER9p3mQFdBdoPW3OQK19pzMGTLTWCMpfzc"
+}

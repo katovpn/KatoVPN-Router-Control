@@ -1,0 +1,32 @@
+{
+  "schema": "katovpn.nikki_router_profile.v1",
+  "profile_name": "KatoVPN - Router Russia",
+  "source_capture_date": "2026-08-03",
+  "source_platform": {
+    "firmware": "ImmortalWrt 24.10-SNAPSHOT",
+    "kernel": "6.6.119",
+    "nikki": "2025.12.21-r1",
+    "luci_app_nikki": "1.25.0-r1",
+    "firewall": "firewall4/nftables"
+  },
+  "traffic_mode": {
+    "tcp": "redirect",
+    "udp": "tproxy",
+    "tun": false,
+    "ipv4": true,
+    "ipv6": false,
+    "dns_hijack_ipv4": true
+  },
+  "subscription": {
+    "included": false,
+    "user_agent": "mihomo KatoVPN-Router/1.0",
+    "required_policy_targets": [
+      "DIRECT",
+      "⚡️ Авто",
+      "🇳🇱 Нидерланды"
+    ]
+  },
+  "secrets_included": false,
+  "runtime_cache_included": false,
+  "device_wide_openwrt_config_included": false
+}

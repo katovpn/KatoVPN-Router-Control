@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.spec
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+operations/tmp/
+*.exe
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+secrets/
