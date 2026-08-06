@@ -115,20 +115,31 @@ def parse_public_ip_info(raw: str) -> dict[str, Any]:
         address = str(ipaddress.ip_address(str(value.get("ip", ""))))
     except (json.JSONDecodeError, ValueError):
         return empty
-    country_code = str(value.get("country_code") or "").upper()
+    country_code = str(value.get("country_code") or value.get("country_iso") or "").upper()
     if not re.fullmatch(r"[A-Z]{2}", country_code):
         country_code = ""
 
-    def clean(field: str, maximum: int = 120) -> str | None:
-        text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value.get(field) or "")).strip()
+    def clean_value(raw_value: Any, maximum: int = 120) -> str | None:
+        text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(raw_value or "")).strip()
         return text[:maximum] or None
 
-    provider = clean("org", 160) or clean("asn", 80)
+    def clean(field: str, maximum: int = 120) -> str | None:
+        return clean_value(value.get(field), maximum)
+
+    connection = value.get("connection") if isinstance(value.get("connection"), Mapping) else {}
+    provider = (
+        clean("org", 160)
+        or clean("asn_org", 160)
+        or clean_value(connection.get("isp"), 160)
+        or clean_value(connection.get("org"), 160)
+        or clean("asn", 80)
+        or clean_value(connection.get("asn"), 80)
+    )
     return {
         "available": True,
         "ip": address,
         "city": clean("city"),
-        "region": clean("region"),
+        "region": clean("region") or clean("region_name"),
         "country_code": country_code or None,
         "country": clean("country_name") or clean("country"),
         "flag": _country_flag(country_code),
@@ -252,18 +263,32 @@ def fetch_subscription_summary(url: str, get: Callable[..., Any] = requests.get)
         raise SetupError("subscription_unavailable", "Не удалось прочитать установленную подписку.") from exc
 
 
-def _wifi_networks(raw: str) -> list[dict[str, Any]]:
+def _wifi_inventory(raw: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         radios = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        return []
+        return [], []
     if not isinstance(radios, Mapping):
-        return []
+        return [], []
     networks: list[dict[str, Any]] = []
+    inventory: list[dict[str, Any]] = []
     for radio_name, radio in radios.items():
-        if not isinstance(radio, Mapping):
+        radio_name = str(radio_name)
+        if not re.fullmatch(r"radio[A-Za-z0-9_]{0,58}", radio_name) or not isinstance(radio, Mapping):
             continue
         radio_config = radio.get("config") if isinstance(radio.get("config"), Mapping) else {}
+        country = str(radio_config.get("country", "")).upper()
+        if not re.fullmatch(r"[A-Z]{2}", country):
+            country = ""
+        inventory.append(
+            {
+                "name": radio_name,
+                "band": str(radio_config.get("band", "unknown")),
+                "country": country or None,
+                "allowed_countries": ["RU", "CN"],
+                "up": bool(radio.get("up", False)),
+            }
+        )
         for interface in radio.get("interfaces", []) or []:
             if not isinstance(interface, Mapping):
                 continue
@@ -276,16 +301,17 @@ def _wifi_networks(raw: str) -> list[dict[str, Any]]:
             networks.append(
                 {
                     "section": str(interface.get("section", "")),
-                    "radio": str(radio_name),
+                    "radio": radio_name,
                     "ssid": str(config.get("ssid", "Без имени")),
                     "encryption": str(config.get("encryption", "none")),
                     "band": str(radio_config.get("band", "unknown")),
                     "channel": str(radio_config.get("channel", "auto")),
+                    "country": country or None,
                     "network": [str(item) for item in network] if isinstance(network, list) else [],
                     "up": bool(radio.get("up", False)),
                 }
             )
-    return networks
+    return networks, inventory
 
 
 def _compatibility_checks(
@@ -370,11 +396,14 @@ def inspect_router(
             )
         )
         public_ip_raw = session.run(
-            "if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 10 -A 'KatoVPN-Router-Control/0.4' https://ipapi.co/json/; "
-            "elif command -v uclient-fetch >/dev/null 2>&1; then uclient-fetch -q -T 10 -O - https://ipapi.co/json/; "
-            "elif command -v wget >/dev/null 2>&1; then wget -q -T 10 -O - https://ipapi.co/json/; fi",
+            "if command -v curl >/dev/null 2>&1; then fetch='curl -fsSL --max-time 8 -A KatoVPN-Router-Control/0.4'; "
+            "elif command -v uclient-fetch >/dev/null 2>&1; then fetch='uclient-fetch -q -T 8 -O -'; "
+            "elif command -v wget >/dev/null 2>&1; then fetch='wget -q -T 8 -O -'; else fetch=''; fi; "
+            "if [ -n \"$fetch\" ]; then for url in https://ipapi.co/json/ https://ipwho.is/ https://ifconfig.co/json; do "
+            "payload=$($fetch \"$url\" 2>/dev/null) || continue; [ -n \"$payload\" ] || continue; "
+            "printf '%s' \"$payload\"; break; done; fi",
             label="control-public-ip",
-            timeout=15,
+            timeout=30,
             check=False,
         )
         packages: dict[str, dict[str, str]] = {}
@@ -388,6 +417,14 @@ def inspect_router(
                 check=False,
             )
             packages.update(_package_blocks(raw))
+        adblock_available_raw = session.run(
+            "if command -v opkg >/dev/null 2>&1; then "
+            "opkg list adblock 2>/dev/null | awk '$1==\"adblock\" {print $3; exit}'; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk info -a adblock 2>/dev/null | sed -n 's/^adblock-//p' | head -n 1; fi",
+            label="control-adblock-available",
+            check=False,
+        )
         mihomo_runtime_raw = session.run(
             "if command -v mihomo >/dev/null 2>&1; then mihomo -v 2>/dev/null | head -n 1; "
             "elif [ -x /usr/bin/mihomo ]; then /usr/bin/mihomo -v 2>/dev/null | head -n 1; "
@@ -431,6 +468,7 @@ def inspect_router(
             )
         )
         wifi_raw = session.run("wifi status 2>/dev/null || ubus call network.wireless status", label="control-wifi", check=False)
+        wifi_networks, wifi_radios = _wifi_inventory(wifi_raw)
         backups_raw = session.run(
             "for d in /root/katovpn-nikki-backups/*; do [ -d \"$d\" ] || continue; id=${d##*/}; "
             "ts=$(stat -c %Y \"$d\" 2>/dev/null || echo 0); size=$(du -sk \"$d\" 2>/dev/null | awk '{print $1}'); "
@@ -493,6 +531,14 @@ def inspect_router(
         mihomo_latest = package_versions.get(mihomo_latest_package)
         nikki_update_available = bool(_semantic_version(nikki_latest) > _semantic_version(nikki_version))
         mihomo_update_available = bool(_semantic_version(mihomo_latest) > _semantic_version(mihomo_version))
+        adblock_installed = all(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru"))
+        adblock_partial = (
+            any(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru"))
+            and not adblock_installed
+        )
+        adblock_version = (packages.get("adblock") or {}).get("Version")
+        adblock_latest = adblock_available_raw.strip().splitlines()[0] if adblock_available_raw.strip() else adblock_version
+        adblock_update_available = bool(_semantic_version(adblock_latest) > _semantic_version(adblock_version))
         components = {
             "nikki": {
                 "installed": capacity.get("nikki") == "1",
@@ -521,13 +567,20 @@ def inspect_router(
                 ),
             },
             "adblock": {
-                "installed": all(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")),
-                "partial": any(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")),
-                "version": (packages.get("adblock") or {}).get("Version"),
+                "installed": adblock_installed,
+                "partial": adblock_partial,
+                "version": adblock_version,
+                "latest": adblock_latest,
+                "update_available": adblock_update_available,
                 "eligible": _integer(capacity, "memory_kb") >= ADBLOCK_CLASS_RAM_KB,
                 "minimum_memory_mb": ADBLOCK_CLASS_RAM_KB // 1024,
                 "packages": ["adblock", "luci-app-adblock", "luci-i18n-adblock-ru"],
-                "status": "current" if all(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")) else "partial" if any(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")) else "available",
+                "status": (
+                    "update_available" if adblock_update_available else
+                    "current" if adblock_installed else
+                    "partial" if adblock_partial else
+                    "available"
+                ),
             },
         }
         installation_needed = not components["nikki"]["installed"] or not components["mihomo"]["installed"]
@@ -567,7 +620,8 @@ def inspect_router(
                 "checks": checks,
                 "blockers": blockers,
             },
-            "wifi": _wifi_networks(wifi_raw),
+            "wifi": wifi_networks,
+            "wifi_radios": wifi_radios,
             "lan": {
                 "ipaddr": lan_raw.get("ipaddr") or spec.host,
                 "netmask": lan_raw.get("netmask") or "255.255.255.0",
@@ -588,8 +642,8 @@ def inspect_router(
             "safety": {
                 "hardware_mutations_validated": HARDWARE_MUTATIONS_VALIDATED,
                 "install_enabled": HARDWARE_MUTATIONS_VALIDATED and not install_blockers,
-                "wifi_changes_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(_wifi_networks(wifi_raw)),
-                "wifi_create_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(_wifi_networks(wifi_raw)),
+                "wifi_changes_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(wifi_networks) and bool(wifi_radios),
+                "wifi_create_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(wifi_radios),
                 "lan_changes_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("proto") in {"static", ""},
                 "password_change_enabled": (
                     lan_raw.get("rollback") == "1"
@@ -598,7 +652,11 @@ def inspect_router(
                     and lan_raw.get("shadow") == "1"
                 ),
                 "backup_management_enabled": components["nikki"]["installed"],
-                "adblock_install_enabled": components["adblock"]["eligible"] and not components["adblock"]["installed"] and internet.get("https") == "1",
+                "adblock_install_enabled": (
+                    components["adblock"]["eligible"]
+                    and (not components["adblock"]["installed"] or components["adblock"]["update_available"])
+                    and internet.get("https") == "1"
+                ),
                 "log_export_enabled": components["nikki"]["installed"],
                 "full_restore_enabled": HARDWARE_MUTATIONS_VALIDATED,
             },

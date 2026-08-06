@@ -181,13 +181,151 @@ class NikkiRouterSetupTests(unittest.TestCase):
     def test_timed_rollback_commands_never_embed_wifi_password(self) -> None:
         operation_id = "20260806-100000-deadbeef"
         rollback = core_module.build_wifi_rollback_command(operation_id)
-        apply = core_module.build_wifi_apply_command("default_radio0", "radio0", "RU", operation_id)
+        apply = core_module.build_wifi_apply_command(
+            "default_radio0",
+            "radio0",
+            "RU",
+            operation_id,
+            password_changed=True,
+        )
 
         self.assertIn("sleep 120", rollback)
         self.assertIn("sae-mixed", apply)
         self.assertIn("/tmp/kato-wifi-key", apply)
+        self.assertIn("wireless.radio0.disabled='0'", apply)
         self.assertNotIn("correct horse", apply)
         self.assertIn("start-stop-daemon", rollback)
+
+    def test_wifi_edit_preserves_password_when_blank(self) -> None:
+        sessions: list[FakeSession] = []
+
+        class WifiSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                value = super().run(command, label=label, timeout=timeout, check=check)
+                return {
+                    "проверка безопасной настройки Wi-Fi": (
+                        "radio_type=mac80211\nmode=ap\ndevice=radio0\nrollback=1\n"
+                        "sha256=1\nsae=1\nconfig_sha256=before-edit"
+                    ),
+                    "таймер отката Wi-Fi": "",
+                    "изменение Wi-Fi": "",
+                    "проверка Wi-Fi после изменения": (
+                        "mode=ap\ndevice=radio1\ncountry=CN\nradio_enabled=1\n"
+                        f"ssid_sha256={core_module.hashlib.sha256('Kato Edited'.encode('utf-8')).hexdigest()}"
+                    ),
+                    "подтверждение Wi-Fi": "",
+                }.get(label, value)
+
+        def factory(spec: ConnectionSpec) -> WifiSession:
+            session = WifiSession(spec)
+            sessions.append(session)
+            return session
+
+        result = core_module.change_wifi_configuration(
+            self.spec,
+            "SHA256:unit-test-router",
+            radio="radio1",
+            section="default_radio0",
+            ssid="Kato Edited",
+            password="",
+            country="CN",
+            session_factory=factory,
+            sleep=lambda _seconds: None,
+        )
+
+        writes = {path: data for session in sessions for path, data in session.writes.items()}
+        commands = {label: command for session in sessions for label, command in session.commands.items()}
+        apply_command = commands["изменение Wi-Fi"]
+        verify_command = commands["проверка Wi-Fi после изменения"]
+        self.assertEqual("wifi_edit", result["operation"])
+        self.assertFalse(result["password_changed"])
+        self.assertEqual("Kato Edited", result["ssid"])
+        self.assertEqual("radio1", result["radio"])
+        self.assertEqual("CN", result["country"])
+        self.assertNotIn("password", result)
+        self.assertEqual(b"Kato Edited", writes["/tmp/kato-wifi-ssid"])
+        self.assertNotIn("/tmp/kato-wifi-key", writes)
+        self.assertNotIn("cat /tmp/kato-wifi-key", apply_command)
+        self.assertNotIn(".key", apply_command)
+        self.assertNotIn(".encryption", apply_command)
+        self.assertIn("wireless.default_radio0.device=radio1", apply_command)
+        self.assertIn("wireless.radio1.country=CN", apply_command)
+        self.assertIn("wireless.default_radio0.mode", verify_command)
+        self.assertIn("wireless.default_radio0.device", verify_command)
+        self.assertIn("wireless.default_radio0.ssid", verify_command)
+        self.assertIn("wireless.radio1.country", verify_command)
+        self.assertNotIn("wireless.default_radio0.key", verify_command)
+
+    def test_wifi_edit_replaces_password_without_exposing_it(self) -> None:
+        sessions: list[FakeSession] = []
+        replacement = "fixture-replacement-psk"
+        ssid = "Kato Secure"
+        ssid_hash = core_module.hashlib.sha256(ssid.encode("utf-8")).hexdigest()
+        key_hash = core_module.hashlib.sha256(replacement.encode("utf-8")).hexdigest()
+
+        class WifiSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                value = super().run(command, label=label, timeout=timeout, check=check)
+                return {
+                    "проверка безопасной настройки Wi-Fi": (
+                        "radio_type=mac80211\nmode=ap\ndevice=radio0\nrollback=1\n"
+                        "sha256=1\nsae=1\nconfig_sha256=before-edit"
+                    ),
+                    "таймер отката Wi-Fi": "",
+                    "изменение Wi-Fi": "",
+                    "проверка Wi-Fi после изменения": (
+                        f"mode=ap\ndevice=radio1\ncountry=RU\nradio_enabled=1\nssid_sha256={ssid_hash}\n"
+                        f"encryption=sae-mixed\nkey_sha256={key_hash}"
+                    ),
+                    "подтверждение Wi-Fi": "",
+                }.get(label, value)
+
+        def factory(spec: ConnectionSpec) -> WifiSession:
+            session = WifiSession(spec)
+            sessions.append(session)
+            return session
+
+        result = core_module.change_wifi_configuration(
+            self.spec,
+            "SHA256:unit-test-router",
+            radio="radio1",
+            section="default_radio0",
+            ssid=ssid,
+            password=replacement,
+            country="RU",
+            session_factory=factory,
+            sleep=lambda _seconds: None,
+        )
+
+        writes = {path: data for session in sessions for path, data in session.writes.items()}
+        commands = "\n".join(command for session in sessions for command in session.commands.values())
+        verify_command = next(
+            session.commands["проверка Wi-Fi после изменения"]
+            for session in sessions
+            if "проверка Wi-Fi после изменения" in session.commands
+        )
+        self.assertEqual(replacement.encode("utf-8"), writes["/tmp/kato-wifi-key"])
+        self.assertEqual(ssid.encode("utf-8"), writes["/tmp/kato-wifi-ssid"])
+        self.assertNotIn(replacement, commands)
+        self.assertNotIn(replacement, json.dumps(result, ensure_ascii=False))
+        self.assertEqual("wifi_edit", result["operation"])
+        self.assertTrue(result["password_changed"])
+        self.assertIn("wireless.default_radio0.key", verify_command)
+        self.assertIn("wireless.default_radio0.encryption", verify_command)
+
+    def test_wifi_create_still_rejects_an_empty_password(self) -> None:
+        with self.assertRaises(SetupError) as raised:
+            core_module.change_wifi_configuration(
+                self.spec,
+                "SHA256:unit-test-router",
+                radio="radio0",
+                ssid="Kato New",
+                password="",
+                country="RU",
+                session_factory=lambda _spec: self.fail("invalid create must not connect"),
+            )
+
+        self.assertEqual("invalid_wifi_password", raised.exception.code)
 
     def test_router_password_change_uses_shadow_rollback_and_never_embeds_passwords(self) -> None:
         self.assertTrue(hasattr(core_module, "change_router_password"), "guarded router password operation is missing")

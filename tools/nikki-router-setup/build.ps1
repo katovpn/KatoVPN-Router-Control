@@ -1,12 +1,17 @@
 [CmdletBinding()]
 param(
     [string]$OutputDirectory,
+    [string]$PythonExecutable,
     [switch]$SkipTests
 )
 
 $ErrorActionPreference = 'Stop'
 $ToolRoot = $PSScriptRoot
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $ToolRoot)
+if (-not $PythonExecutable) {
+    $RepoVenvPython = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+    $PythonExecutable = if (Test-Path -LiteralPath $RepoVenvPython) { $RepoVenvPython } else { 'python' }
+}
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $RepoRoot 'operations\tmp\nikki-router-setup'
 }
@@ -14,8 +19,10 @@ $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $ScratchRoot = Join-Path $OutputDirectory '.build'
 $SpecRoot = Join-Path $ScratchRoot 'spec'
 $WorkRoot = Join-Path $ScratchRoot 'work'
-$ArtifactBase = 'KatoVPN-Router-Control-v0.4.2-preview'
+$ArtifactBase = 'KatoVPN-Router-Control-v0.4.3-preview'
 $ExePath = Join-Path $OutputDirectory "$ArtifactBase.exe"
+$VersionInfoPath = Join-Path $ToolRoot 'windows-version-info.txt'
+$ManifestPath = Join-Path $ToolRoot 'windows-app.manifest'
 
 function Assert-PathInsideDirectory {
     param([string]$Path, [string]$Directory)
@@ -31,20 +38,23 @@ Assert-PathInsideDirectory -Path $ExePath -Directory $OutputDirectory
 New-Item -ItemType Directory -Force -Path $OutputDirectory,$SpecRoot,$WorkRoot | Out-Null
 
 if (-not $SkipTests) {
-    & python -m unittest discover -s (Join-Path $RepoRoot 'tools\tests') -p 'test_*router*.py' -v
+    & $PythonExecutable -m unittest discover -s (Join-Path $RepoRoot 'tools\tests') -p 'test_*router*.py' -v
     if ($LASTEXITCODE -ne 0) { throw 'Nikki router setup tests failed.' }
 }
 
 $addWeb = "{0};web" -f (Join-Path $ToolRoot 'web')
 $addProfile = "{0};profile" -f (Join-Path $ToolRoot 'profile')
 $iconPath = Join-Path $ToolRoot 'web\logo.png'
-& python -m PyInstaller `
+& $PythonExecutable -m PyInstaller `
     --noconfirm `
     --clean `
     --onefile `
     --windowed `
+    --noupx `
     --name $ArtifactBase `
     --icon $iconPath `
+    --version-file $VersionInfoPath `
+    --manifest $ManifestPath `
     --distpath $OutputDirectory `
     --workpath $WorkRoot `
     --specpath $SpecRoot `

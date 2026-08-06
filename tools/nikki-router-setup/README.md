@@ -1,13 +1,13 @@
 # KatoVPN Router Control
 
-Local desktop-style control application for a KatoVPN OpenWrt router. The current release is `v0.4.2-preview` for Windows and is built as one self-contained executable.
+Local desktop-style control application for a KatoVPN OpenWrt router. The current release is `v0.4.3-preview` for Windows and is built as one self-contained executable.
 
 ## Current interface
 
 - The welcome screen defaults to `192.168.11.1` and asks for router address, SSH port, username, and password.
 - **Home** shows OpenWrt compatibility, public IP, country flag, location/provider, and VPN subscription state/expiry checked from the installed HTTPS link. A valid 200+ MiB router receives the readiness point even when 512 MiB is still recommended.
-- **Internet** lists Wi-Fi access points with detected 2.4/5/6 GHz radio labels, can create an access point or replace its password with `WPA2-PSK/WPA3-SAE Mixed Mode`, can change the private LAN IP, can change the router administrator password with a two-minute router-side rollback, and contains the one-hour temporary KatoVPN support flow.
-- **Firmware** presents Nikki, Mihomo, and optional AdBlock as installed modules, keeps the current subscription URL editable, and manages Nikki settings backups.
+- **Internet** lists Wi-Fi access points with detected 2.4/5/6 GHz radio labels, can create an access point or edit its name, optional password, radio, and RU/CN country code, can change the private LAN IP, and can change the router administrator password with a two-minute router-side rollback.
+- **Maintenance** presents Nikki, Mihomo, and optional AdBlock as installed modules, keeps the current subscription URL editable, provides the one-hour temporary KatoVPN support flow, and manages Nikki settings backups.
 - **Logs** combines Nikki App Log, Mihomo Core Log, and matching OpenWrt events into one sanitized VPN journal; the selected line count applies to each source. A separate button creates a diagnostic report as `.txt`.
 - An existing subscription URL can be replaced in place without package updates. If Nikki/Mihomo are absent, the validated URL is staged only in the current app session for the future clean-install flow.
 
@@ -30,7 +30,7 @@ The preferred install plan registers Nikki's signed official feed. If the router
 
 ## Enabled operations and safety boundary
 
-The preview enables targeted Nikki/Mihomo updates, installed-profile configuration, Wi-Fi creation/password changes, private LAN IP changes, router administrator password changes, optional AdBlock installation, Nikki backup create/restore/delete, and sanitized log export. Wi-Fi, LAN, and router-password mutations require a pinned SSH fingerprint and arm a two-minute rollback on the router before applying the change; success is confirmed only after the app reconnects and verifies the new values.
+The preview enables targeted Nikki/Mihomo updates, installed-profile configuration, Wi-Fi creation and full access-point editing, private LAN IP changes, router administrator password changes, optional AdBlock installation, Nikki backup create/restore/delete, and sanitized log export. An existing Wi-Fi password is preserved when the edit form leaves the password empty; the app never reads it from the router. Wi-Fi, LAN, and router-password mutations require a pinned SSH fingerprint and arm a two-minute rollback on the router before applying the change; success is confirmed only after the app reconnects and verifies the new values.
 
 AdBlock is optional and is offered only to a 512-MB-class router (at least 448 MiB reported by OpenWrt). The app refreshes package metadata, verifies all three official packages (`adblock`, `luci-app-adblock`, `luci-i18n-adblock-ru`), performs a dry run, and installs only those packages. It never runs a blanket package upgrade.
 
@@ -38,7 +38,7 @@ Clean Nikki installation and full OpenWrt backup/restore remain disabled until a
 
 Temporary support is implemented fail-closed. The desktop creates an outbound reverse SSH tunnel that forwards only the connected router's SSH endpoint; it does not install NetBird/Tailscale or open Dropbear on WAN. A separate support public key is appended with an exact session marker and forced through a remaining-lease `timeout`, so an already-open shell cannot outlive the hour. Both a detached timer and a persistent OpenWrt cron cleanup remove that key after one hour, including after a router reboot. Manual stop, logout, and process exit close the tunnel, revoke the relay lease, and attempt immediate key removal.
 
-The preview contains no relay secret. Its bundled `profile/support-relay.json` currently enables the public `https://router-support.katovpn.app/v1` broker with only a public HTTPS URL and pinned SSH host-key fingerprint. DNS-only A, free Let's Encrypt TLS, public lease create/revoke, and zero-session cleanup were verified on 2026-08-06. Treat this KatoVPN-branded hostname as temporary and replace it with a separate neutral domain later. The support action remains preview-gated for general distribution until the final representative-router expiry/disconnect pilot passes.
+The preview contains no relay secret. Its bundled `profile/support-relay.json` currently enables the public `https://router-support.katovpn.app/v1` broker with only a public HTTPS URL and pinned SSH host-key fingerprint. DNS-only A, free Let's Encrypt TLS, public lease create/revoke, an external operator connection, manual revoke, temporary-key removal, and zero-session cleanup were verified on 2026-08-06. Routers without a BusyBox `timeout` applet use a PID/start-time guarded one-hour cleanup fallback. Treat this KatoVPN-branded hostname as temporary and replace it with a separate neutral domain later.
 
 A Nikki settings backup can restore UCI, profiles, subscriptions, and mixin data. It cannot reinstall or downgrade Nikki/Mihomo package binaries. Full firmware-image flashing is outside this application's scope.
 
@@ -56,9 +56,11 @@ python tools/nikki-router-setup/app.py
 
 The artifact is written to the ignored path:
 
-`operations/tmp/nikki-router-setup/KatoVPN-Router-Control-v0.4.2-preview.exe`
+`operations/tmp/nikki-router-setup/KatoVPN-Router-Control-v0.4.3-preview.exe`
 
 Send the user only this `.exe`. Python, PowerShell modules, the source tree, and an adjacent asset folder are not required: PyInstaller embeds the Python runtime, web UI, profile template, and logo. The build is currently unsigned, so Windows SmartScreen may show an unknown-publisher warning.
+
+The executable contains explicit Windows product/version metadata and is built without UPX. The public release workflow also publishes SHA-256, an SBOM, and GitHub build provenance. Authenticode signing remains pending acceptance into a trusted signing service; a self-signed certificate is intentionally not used because Windows treats it like an unsigned application.
 
 The Windows executable cannot run on macOS. A future macOS `.app`/`.dmg` should be built from the same Python core and web UI on macOS.
 

@@ -130,7 +130,7 @@ function switchView(view) {
   const titles = {
     home: ["Обзор системы", "Главная"],
     internet: ["Домашняя сеть", "Интернет"],
-    firmware: ["Возможности роутера", "Прошивка"],
+    firmware: ["Возможности роутера", "Обслуживание"],
     logs: ["Диагностика", "Логи"],
   };
   if (!titles[view]) return;
@@ -219,7 +219,7 @@ async function startSupport() {
     showError(error.message);
     await refreshSupportStatus();
   } finally {
-    setBusy(button, false, "Разрешить поддержку на 1 час");
+    setBusy(button, false, "Разрешить подключение");
   }
 }
 
@@ -233,7 +233,7 @@ async function stopSupport() {
   } catch (error) {
     showError(error.message);
   } finally {
-    setBusy(button, false, "Отключить поддержку");
+    setBusy(button, false, "Завершить доступ");
   }
 }
 
@@ -273,9 +273,12 @@ function formatBandLabel(band) {
   return "диапазон не определён";
 }
 
-function formatRadioLabel(radio, networks) {
-  const network = (networks || []).find((item) => item.radio === radio);
-  return `${radio} — ${formatBandLabel(network?.band)}`;
+function formatRadioLabel(radio, inventory = []) {
+  const name = typeof radio === "object" ? radio?.name : radio;
+  const details = typeof radio === "object"
+    ? radio
+    : (inventory || []).find((item) => item.name === name || item.radio === name);
+  return `${name} — ${formatBandLabel(details?.band)}`;
 }
 
 function emptyRow(titleText, subtitleText) {
@@ -352,7 +355,7 @@ function renderDashboard(report) {
           : "Подписка активна. Срок действия не указан в ответе по ссылке."
     : subscription.staged
       ? "Ссылка сохранена. Установите VPN-модули, чтобы создать профиль KatoVPN."
-      : "Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Прошивка».";
+      : "Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Обслуживание».";
   if (document.activeElement !== $("#subscription-url")) $("#subscription-url").value = subscription.url || "";
 
   const wifi = report.wifi || [];
@@ -364,7 +367,7 @@ function renderDashboard(report) {
     const name = document.createElement("strong");
     const details = document.createElement("small");
     name.textContent = network.ssid;
-    details.textContent = `${formatRadioLabel(network.radio, wifi)} · канал ${network.channel} · ${network.encryption}`;
+    details.textContent = `${formatRadioLabel(network.radio, report.wifi_radios || wifi)} · канал ${network.channel} · ${network.encryption}`;
     main.append(name, details);
     const side = document.createElement("div");
     side.className = "row-side";
@@ -373,8 +376,8 @@ function renderDashboard(report) {
     const edit = document.createElement("button");
     edit.type = "button";
     edit.disabled = !safety.wifi_changes_enabled;
-    edit.textContent = "Сменить пароль";
-    edit.addEventListener("click", () => openWifiDialog("change_password", network));
+    edit.textContent = "Изменить";
+    edit.addEventListener("click", () => openWifiDialog("edit", network));
     side.append(status, edit);
     row.append(main, side);
     return row;
@@ -397,39 +400,49 @@ function renderDashboard(report) {
     const sub = document.createElement("small");
     title.textContent = labels[key];
     if (key === "adblock") {
-      if (component.installed) sub.textContent = `Установлен${component.version ? ` · версия ${component.version}` : ""}`;
+      if (component.installed) sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
       else if (!component.eligible) sub.textContent = "Опционально для роутеров класса 512 МБ";
       else if (component.partial) sub.textContent = "Установлена только часть пакетов";
       else sub.textContent = "AdBlock + панель LuCI + русский язык";
     } else if (component.status === "runtime_missing") sub.textContent = `Пакет ${component.package_version || "установлен"}, но ядро не запускается`;
     else if (!component.installed) sub.textContent = "Не установлен";
-    else if (key === "mihomo" && !component.managed) sub.textContent = `Работает · версия ${component.version || "не определена"} · пакет не зарегистрирован`;
-    else sub.textContent = `Текущая версия ${component.version || "не определена"}`;
+    else if (key === "mihomo" && !component.managed) sub.textContent = `Версия ${component.version || "не определена"} · установлено вручную`;
+    else sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
     main.append(title, sub);
 
     const side = document.createElement("div");
     side.className = "row-side";
     const status = document.createElement("span");
     status.className = `component-status ${component.update_available ? "available" : component.installed ? "current" : "missing"}`;
-    if (key === "adblock") status.textContent = component.installed ? "Установлен" : component.eligible ? "Доступен" : "Не рекомендуется";
-    else status.textContent = component.status === "runtime_missing"
+    status.textContent = component.status === "runtime_missing"
       ? "Нужно восстановление"
+      : component.partial
+        ? "Нужно завершить"
       : component.update_available
         ? `Доступна ${component.latest}`
-        : component.installed ? "Последняя версия" : "Требуется установка";
-    const action = document.createElement("button");
-    action.type = "button";
-    action.setAttribute("data-update-component", key);
-    if (key === "adblock") {
-      action.textContent = component.installed ? "Установлен" : "Установить";
+        : component.installed
+          ? "Последняя версия"
+          : key === "adblock" && !component.eligible
+            ? "Не рекомендуется"
+            : key === "adblock" ? "Доступен" : "Требуется установка";
+    side.append(status);
+
+    if (key === "adblock" && (!component.installed || component.partial || component.update_available)) {
+      const action = document.createElement("button");
+      action.type = "button";
+      action.setAttribute("data-update-component", key);
+      action.textContent = component.update_available ? "Обновить" : component.partial ? "Завершить" : "Установить";
       action.disabled = !safety.adblock_install_enabled;
       action.addEventListener("click", startAdblockInstall);
-    } else {
-      action.textContent = component.update_available ? `Обновить` : component.installed ? "Актуально" : "Установить позже";
-      action.disabled = !component.update_available;
+      side.append(action);
+    } else if (key !== "adblock" && component.update_available) {
+      const action = document.createElement("button");
+      action.type = "button";
+      action.setAttribute("data-update-component", key);
+      action.textContent = "Обновить";
       action.addEventListener("click", () => startUpdate(key));
+      side.append(action);
     }
-    side.append(status, action);
     row.append(main, side);
     return row;
   }));
@@ -576,8 +589,18 @@ async function startUpdate(componentKey) {
 }
 
 async function startAdblockInstall() {
-  if (!window.confirm("Будут установлены три официальных пакета: AdBlock, панель LuCI и русский язык. Продолжить?")) return;
-  startJob("/api/router/install-adblock", { confirmed: true }, "Установка AdBlock", "Сначала пакетный менеджер выполнит проверку без изменений.");
+  const component = state.routerSession?.dashboard?.components?.adblock || {};
+  const updating = Boolean(component.installed && component.update_available);
+  const confirmation = updating
+    ? "Перед обновлением AdBlock приложение создаст резервную копию настроек. Продолжить?"
+    : "Будут установлены три официальных пакета: AdBlock, панель LuCI и русский язык. Продолжить?";
+  if (!window.confirm(confirmation)) return;
+  startJob(
+    "/api/router/install-adblock",
+    { confirmed: true },
+    updating ? "Обновление AdBlock" : "Установка AdBlock",
+    "Сначала пакетный менеджер выполнит проверку без изменений."
+  );
 }
 
 async function configureSubscription(event) {
@@ -611,24 +634,34 @@ async function configureSubscription(event) {
 function openWifiDialog(action, network = null) {
   const report = state.routerSession?.dashboard || {};
   const networks = report.wifi || [];
-  const radios = [...new Set(networks.map((item) => item.radio).filter(Boolean))];
+  const radios = (report.wifi_radios || []).length
+    ? report.wifi_radios
+    : [...new Set(networks.map((item) => item.radio).filter(Boolean))].map((name) => ({
+        name,
+        band: networks.find((item) => item.radio === name)?.band,
+        country: networks.find((item) => item.radio === name)?.country,
+      }));
   $("#wifi-radio").replaceChildren(...radios.map((radio) => {
     const option = document.createElement("option");
-    option.value = radio;
-    option.textContent = formatRadioLabel(radio, networks);
+    option.value = radio.name;
+    option.textContent = formatRadioLabel(radio);
     return option;
   }));
   $("#wifi-action").value = action;
   $("#wifi-section").value = network?.section || "";
-  $("#wifi-radio").value = network?.radio || radios[0] || "";
-  $("#wifi-radio").disabled = action === "change_password";
-  $("#wifi-ssid-field").classList.toggle("hidden", action !== "create");
-  $("#wifi-dialog-title").textContent = action === "create" ? "Создать Wi‑Fi сеть" : `Сменить пароль · ${network?.ssid || "Wi‑Fi"}`;
+  $("#wifi-radio").value = network?.radio || radios[0]?.name || "";
+  $("#wifi-radio").disabled = false;
+  $("#wifi-dialog-title").textContent = action === "create" ? "Создать Wi‑Fi сеть" : `Изменить · ${network?.ssid || "Wi‑Fi"}`;
+  $("#wifi-dialog-copy").textContent = action === "create"
+    ? "Задайте параметры новой сети. На подтверждение после применения будет две минуты."
+    : "Можно изменить название, радиомодуль и код страны. Новый пароль указывать необязательно.";
   $("#wifi-password").value = "";
-  $("#wifi-ssid").value = "";
-  $("#wifi-country").value = report.lan?.recommended_country || "RU";
+  $("#wifi-password").required = action === "create";
+  $("#wifi-ssid").value = network?.ssid || "";
+  const selectedRadio = radios.find((item) => item.name === (network?.radio || $("#wifi-radio").value));
+  $("#wifi-country").value = network?.country || selectedRadio?.country || report.lan?.recommended_country || "RU";
   $("#wifi-dialog").showModal();
-  window.setTimeout(() => (action === "create" ? $("#wifi-ssid") : $("#wifi-password")).focus(), 50);
+  window.setTimeout(() => $("#wifi-ssid").focus(), 50);
 }
 
 async function submitWifi(event) {
@@ -643,12 +676,12 @@ async function submitWifi(event) {
     password: $("#wifi-password").value,
     country: $("#wifi-country").value,
   };
-  if (payload.password.length < 8) return showError("Пароль Wi‑Fi должен содержать минимум 8 символов.");
-  if (action === "create" && !payload.ssid) return showError("Введите название новой Wi‑Fi сети.");
-  const warning = "Связь может прерваться. Подключитесь с новым паролем в течение двух минут, иначе роутер вернёт прежние настройки. Продолжить?";
+  if (!payload.ssid) return showError("Введите название Wi‑Fi сети.");
+  if ((action === "create" || payload.password) && payload.password.length < 8) return showError("Пароль Wi‑Fi должен содержать минимум 8 символов.");
+  const warning = "Связь может прерваться. Подключитесь к изменённой сети в течение двух минут, иначе роутер вернёт прежние настройки. Продолжить?";
   if (!window.confirm(warning)) return;
   $("#wifi-dialog").close();
-  startJob("/api/router/wifi", payload, action === "create" ? "Создание Wi‑Fi" : "Смена пароля Wi‑Fi", "Автоматический откат уже будет включён до изменения сети.");
+  startJob("/api/router/wifi", payload, action === "create" ? "Создание Wi‑Fi" : "Изменение Wi‑Fi", "Автоматический откат уже будет включён до изменения сети.");
 }
 
 async function changeLan(event) {

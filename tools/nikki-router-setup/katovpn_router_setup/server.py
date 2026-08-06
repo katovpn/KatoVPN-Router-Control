@@ -42,7 +42,7 @@ from .control import inspect_router
 from .support import SupportSessionManager
 
 
-APP_VERSION = "0.4.2-preview"
+APP_VERSION = "0.4.3-preview"
 MAX_REQUEST_BYTES = 16 * 1024
 PREFLIGHT_TTL_SECONDS = 10 * 60
 CLIENT_EXIT_GRACE_SECONDS = 4.0
@@ -583,18 +583,34 @@ def make_handler(state: AppState):
                         raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
                     dashboard = saved.get("dashboard") if isinstance(saved.get("dashboard"), Mapping) else {}
                     safety = dashboard.get("safety") if isinstance(dashboard.get("safety"), Mapping) else {}
-                    if not safety.get("wifi_changes_enabled"):
-                        raise SetupError("wifi_change_unavailable", "Роутер не подтвердил безопасный таймер отката Wi‑Fi.")
-                    action = str(payload.get("action", "change_password"))
-                    if action not in {"change_password", "create"}:
+                    action = str(payload.get("action", ""))
+                    if action not in {"edit", "create"}:
                         raise SetupError("invalid_wifi_action", "Неизвестная операция Wi‑Fi.")
+                    safety_flag = "wifi_create_enabled" if action == "create" else "wifi_changes_enabled"
+                    if not safety.get(safety_flag):
+                        raise SetupError("wifi_change_unavailable", "Роутер не подтвердил безопасный таймер отката Wi‑Fi.")
                     spec = saved["spec"]
                     fingerprint = str(saved["fingerprint"])
                     radio = str(payload.get("radio", ""))
                     password = str(payload.get("password", ""))
                     country = str(payload.get("country") or (dashboard.get("lan") or {}).get("recommended_country") or "RU")
-                    section = str(payload.get("section", "")) if action == "change_password" else None
-                    ssid = str(payload.get("ssid", "")) if action == "create" else None
+                    networks = dashboard.get("wifi") if isinstance(dashboard.get("wifi"), list) else []
+                    radios = dashboard.get("wifi_radios") if isinstance(dashboard.get("wifi_radios"), list) else []
+                    target_radio = next(
+                        (item for item in radios if isinstance(item, Mapping) and str(item.get("name", "")) == radio),
+                        None,
+                    )
+                    if target_radio is None:
+                        raise SetupError("invalid_wifi_radio", "Выбранный радиомодуль больше не доступен.")
+                    allowed_countries = target_radio.get("allowed_countries") if isinstance(target_radio.get("allowed_countries"), list) else []
+                    if country.upper() not in {str(item).upper() for item in allowed_countries}:
+                        raise SetupError("invalid_wifi_country", "Выбранный код страны не поддерживается.")
+                    section = str(payload.get("section", "")) if action == "edit" else None
+                    if action == "edit" and not any(
+                        isinstance(item, Mapping) and str(item.get("section", "")) == section for item in networks
+                    ):
+                        raise SetupError("invalid_wifi_section", "Выбранная Wi‑Fi сеть больше не доступна.")
+                    ssid = str(payload.get("ssid", ""))
                     job = state.create_job()
                     self._start_callable_job(
                         job,
