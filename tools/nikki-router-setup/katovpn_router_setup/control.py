@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import re
+import shlex
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
@@ -25,6 +26,7 @@ RECOMMENDED_RAM_KB = 512 * 1024
 MIN_INSTALL_OVERLAY_KB = 64 * 1024
 SUPPORTED_DISTRIBUTIONS = {"openwrt", "immortalwrt"}
 HARDWARE_MUTATIONS_VALIDATED = False
+CLEAN_INSTALL_ENABLED = True
 ADBLOCK_CLASS_RAM_KB = 448 * 1024
 
 NIKKI_DEPENDENCIES = [
@@ -74,6 +76,17 @@ def _integer(values: Mapping[str, str], key: str) -> int:
         return max(0, int(values.get(key, "0")))
     except (TypeError, ValueError):
         return 0
+
+
+def _physical_memory_class_kb(usable_kb: int) -> int:
+    """Map Linux-usable RAM to the nearest standard physical router class."""
+    if usable_kb <= 0:
+        return 0
+    for class_mb in (64, 128, 256, 512, 1024, 2048, 4096, 8192):
+        class_kb = class_mb * 1024
+        if int(class_kb * 0.72) <= usable_kb <= class_kb:
+            return class_kb
+    return usable_kb
 
 
 def _key_values(raw: str) -> dict[str, str]:
@@ -325,6 +338,7 @@ def _compatibility_checks(
     distribution = str(release.get("distribution") or release.get("description") or "").lower()
     firmware = str(release.get("version", ""))
     memory_kb = _integer(capacity, "memory_kb")
+    memory_class_kb = _physical_memory_class_kb(memory_kb)
     overlay_kb = _integer(capacity, "overlay_free_kb")
 
     def check(
@@ -342,17 +356,19 @@ def _compatibility_checks(
     checks = [
         check("openwrt", "OpenWrt", is_openwrt and _version_pair(firmware) >= (24, 10), firmware or "не определена"),
         check("firewall", "Firewall4 / nftables", capacity.get("fw4") == capacity.get("nft") == "1", "готов" if capacity.get("fw4") == capacity.get("nft") == "1" else "не найден"),
-        check("memory", "Оперативная память", memory_kb >= MIN_RAM_KB, f"{memory_kb // 1024} МБ"),
+        check("memory", "Оперативная память", memory_kb >= MIN_RAM_KB, f"{memory_class_kb // 1024} МБ"),
         check("internet", "Интернет с роутера", internet.get("dns") == internet.get("https") == "1", "доступен" if internet.get("dns") == internet.get("https") == "1" else "нет доступа"),
     ]
+    package_manager_ready = capacity.get("opkg") == "1" or capacity.get("apk") == "1"
     install_checks = [
-        check("package_manager", "Установка программ", capacity.get("opkg") == "1" or capacity.get("apk") == "1", "доступна" if capacity.get("opkg") == "1" or capacity.get("apk") == "1" else "не поддерживается", scope="install"),
+        check("package_manager", "Установка программ", package_manager_ready, "доступна" if package_manager_ready else "пакетный менеджер не поддерживается", scope="install"),
         check("overlay", "Свободное место", overlay_kb >= MIN_INSTALL_OVERLAY_KB, f"{overlay_kb // 1024} МБ", scope="install"),
         check("overlay_writable", "Установка пакетов", capacity.get("overlay_writable") == "1", "доступна" if capacity.get("overlay_writable") == "1" else "раздел только для чтения", scope="install"),
+        check("nikki_feed", "Официальный источник VPN-модуля", internet.get("feed") == "1", "доступен" if internet.get("feed") == "1" else "нет доступа", scope="install"),
     ]
-    if memory_kb >= MIN_RAM_KB and memory_kb < RECOMMENDED_RAM_KB:
-        checks.append(check("memory_recommended", "Рекомендуемая память", False, f"{memory_kb // 1024} МБ из 512 МБ", recommendation=True))
-    visible_install_checks = [item for item in install_checks if item["code"] != "package_manager"]
+    if memory_kb >= MIN_RAM_KB and memory_class_kb < RECOMMENDED_RAM_KB:
+        checks.append(check("memory_recommended", "Рекомендуемая память", False, f"{memory_class_kb // 1024} МБ; рекомендуется 512 МБ", recommendation=True))
+    visible_install_checks = [item for item in install_checks if item["code"] == "overlay"]
     return checks + visible_install_checks if installation_needed else checks, checks + install_checks
 
 
@@ -373,8 +389,10 @@ def inspect_router(
                 "free=$(df -Pk /overlay 2>/dev/null | awk 'NR==2 {print $4}'); "
                 "for c in uci fw4 nft opkg apk; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c=1\" || echo \"$c=0\"; done; "
                 "[ -x /www/cgi-bin/luci ] && echo luci=1 || echo luci=0; [ -x /etc/init.d/nikki ] && echo nikki=1 || echo nikki=0; "
-                "if command -v opkg >/dev/null 2>&1; then opkg print-architecture 2>/dev/null | awk '$3>0 {a=$2} END {if(a) print \"package_arch=\" a}'; "
-                "elif command -v apk >/dev/null 2>&1; then a=$(apk --print-arch 2>/dev/null); [ -n \"$a\" ] && echo \"package_arch=$a\"; fi; "
+                "a=''; if [ -r /etc/openwrt_release ]; then . /etc/openwrt_release; a=${DISTRIB_ARCH:-}; fi; "
+                "if [ -z \"$a\" ] && command -v opkg >/dev/null 2>&1; then a=$(opkg print-architecture 2>/dev/null | awk '$3>0 {a=$2} END {print a}'); fi; "
+                "if [ -z \"$a\" ] && command -v apk >/dev/null 2>&1; then a=$(apk --print-arch 2>/dev/null | head -n 1); fi; "
+                "[ -n \"$a\" ] && echo \"package_arch=$a\"; "
                 "printf 'memory_kb=%s\\noverlay_free_kb=%s\\n' \"${mem:-0}\" \"${free:-0}\"; "
                 "[ -w /overlay ] && echo overlay_writable=1 || echo overlay_writable=0",
                 label="control-capacity",
@@ -412,7 +430,12 @@ def inspect_router(
             "adblock", "luci-app-adblock", "luci-i18n-adblock-ru",
         ):
             raw = session.run(
-                f"(opkg status {package_name} 2>/dev/null; apk info -a {package_name} 2>/dev/null) || true",
+                "if command -v opkg >/dev/null 2>&1; then "
+                f"opkg status {package_name} 2>/dev/null || true; "
+                "elif command -v apk >/dev/null 2>&1; then "
+                f"v=$(apk list --installed --manifest {package_name} 2>/dev/null | "
+                f"awk -v p={shlex.quote(package_name)} '$1==p {{print $2; exit}}'); "
+                f"[ -z \"$v\" ] || printf 'Package: %s\\nVersion: %s\\n' {shlex.quote(package_name)} \"$v\"; fi",
                 label=f"control-package-{package_name}",
                 check=False,
             )
@@ -421,7 +444,7 @@ def inspect_router(
             "if command -v opkg >/dev/null 2>&1; then "
             "opkg list adblock 2>/dev/null | awk '$1==\"adblock\" {print $3; exit}'; "
             "elif command -v apk >/dev/null 2>&1; then "
-            "apk info -a adblock 2>/dev/null | sed -n 's/^adblock-//p' | head -n 1; fi",
+            "apk list --manifest -a adblock 2>/dev/null | awk '$1==\"adblock\" {print $2; exit}'; fi",
             label="control-adblock-available",
             check=False,
         )
@@ -592,6 +615,22 @@ def inspect_router(
         )
         blockers = [item for item in checks if item["status"] == "block"]
         install_blockers = [item for item in install_checks if item["status"] == "block"]
+        official_ready = (
+            official.get("status") == "available"
+            and {"nikki", "luci-app-nikki", "mihomo-meta"}.issubset(package_versions)
+        )
+        if not official_ready:
+            install_blockers.append(
+                {
+                    "code": "official_packages",
+                    "title": "Совместимый VPN-модуль",
+                    "status": "block",
+                    "value": "официальный комплект недоступен",
+                    "scope": "install",
+                }
+            )
+        memory_kb = _integer(capacity, "memory_kb")
+        memory_class_kb = _physical_memory_class_kb(memory_kb)
         return {
             "connected": True,
             "fingerprint": session.fingerprint,
@@ -602,7 +641,8 @@ def inspect_router(
                 "firmware": str(release.get("description") or firmware or "неизвестно"),
                 "firmware_version": firmware,
                 "kernel": str(board.get("kernel", "неизвестно")),
-                "memory_mb": _integer(capacity, "memory_kb") // 1024,
+                "memory_mb": memory_class_kb // 1024,
+                "usable_memory_mb": memory_kb // 1024,
                 "package_manager": "opkg" if capacity.get("opkg") == "1" else "apk" if capacity.get("apk") == "1" else "unknown",
             },
             "internet": {
@@ -619,6 +659,7 @@ def inspect_router(
                 "installation_needed": installation_needed,
                 "checks": checks,
                 "blockers": blockers,
+                "install_blockers": install_blockers,
             },
             "wifi": wifi_networks,
             "wifi_radios": wifi_radios,
@@ -641,7 +682,8 @@ def inspect_router(
             "official_packages": {"status": official.get("status", "unavailable"), "branch": official.get("branch"), "versions": dict(package_versions)},
             "safety": {
                 "hardware_mutations_validated": HARDWARE_MUTATIONS_VALIDATED,
-                "install_enabled": HARDWARE_MUTATIONS_VALIDATED and not install_blockers,
+                "clean_install_enabled": CLEAN_INSTALL_ENABLED,
+                "install_enabled": installation_needed and not install_blockers,
                 "wifi_changes_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(wifi_networks) and bool(wifi_radios),
                 "wifi_create_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("wifi_sae") == "1" and bool(wifi_radios),
                 "lan_changes_enabled": lan_raw.get("rollback") == "1" and lan_raw.get("proto") in {"static", ""},
@@ -705,6 +747,6 @@ def build_install_plan(report: Mapping[str, Any], *, pc_packages_available: bool
         "commands": commands,
         "dry_run_required": True,
         "backup_required": True,
-        "hardware_validated": HARDWARE_MUTATIONS_VALIDATED,
-        "enabled": bool(HARDWARE_MUTATIONS_VALIDATED and compatibility.get("install_ready") and method != "unavailable"),
+        "hardware_validated": CLEAN_INSTALL_ENABLED,
+        "enabled": bool(CLEAN_INSTALL_ENABLED and compatibility.get("install_ready") and method != "unavailable"),
     }

@@ -60,10 +60,11 @@ class FakeControlSession:
                     "uci=1",
                     "fw4=1",
                     "nft=1",
-                    "opkg=1",
-                    "apk=0",
+                    f"opkg={self.overrides.get('opkg', 1)}",
+                    f"apk={self.overrides.get('apk', 0)}",
+                    f"package_arch={self.overrides.get('package_arch', 'aarch64_cortex-a53')}",
                     "luci=1",
-                    "nikki=1",
+                    f"nikki={self.overrides.get('nikki_init', 1)}",
                     f"memory_kb={self.overrides.get('memory_kb', 512 * 1024)}",
                     f"flash_kb={self.overrides.get('flash_kb', 256 * 1024)}",
                     f"overlay_free_kb={self.overrides.get('overlay_free_kb', 96 * 1024)}",
@@ -86,8 +87,14 @@ class FakeControlSession:
                 "Package: luci-app-nikki\nVersion: 1.26.1-r1\nArchitecture: all\n\n"
                 "Package: mihomo-meta\nVersion: 1.19.29\nArchitecture: aarch64_cortex-a53"
             ),
-            "control-package-nikki": "Package: nikki\nVersion: 2026.04.08-r1\nArchitecture: aarch64_cortex-a53",
-            "control-package-luci-app-nikki": "Package: luci-app-nikki\nVersion: 1.26.1-r1\nArchitecture: all",
+            "control-package-nikki": (
+                "" if self.overrides.get("missing_nikki") else
+                "Package: nikki\nVersion: 2026.04.08-r1\nArchitecture: aarch64_cortex-a53"
+            ),
+            "control-package-luci-app-nikki": (
+                "" if self.overrides.get("missing_nikki") else
+                "Package: luci-app-nikki\nVersion: 1.26.1-r1\nArchitecture: all"
+            ),
             "control-package-mihomo-meta": (
                 "" if self.overrides.get("unmanaged_mihomo") else
                 "Package: mihomo-meta\nVersion: 1.19.29\nArchitecture: aarch64_cortex-a53"
@@ -116,7 +123,7 @@ class FakeControlSession:
                     "subscription_raw",
                     "id=cfg123\nname=KatoVPN\n"
                     "url=https://subscribe.example.test/private-token\n"
-                    "user_agent=mihomo KatoVPN-Router/1.0\n"
+                    "user_agent=katorouter-ru\n"
                     "expire=2099-12-31 23:59:59\nsuccess=1\nupdate=2026-08-06 10:00:00",
                 )
             ),
@@ -269,7 +276,7 @@ class RouterControlTests(unittest.TestCase):
         report = self.inspect(
             subscription_raw=(
                 "id=cfg123\nname=KatoVPN\nurl=https://subscribe.example.test/private-token\n"
-                "user_agent=mihomo KatoVPN-Router/1.0\nexpire=1970-01-01 00:00:00\n"
+                "user_agent=katorouter-ru\nexpire=1970-01-01 00:00:00\n"
                 "success=0\nupdate=2026-08-06 10:00:00"
             ),
             subscription_result={
@@ -313,6 +320,8 @@ class RouterControlTests(unittest.TestCase):
         report = self.inspect(memory_kb=228 * 1024, flash_kb=69 * 1024, overlay_free_kb=9 * 1024, kernel="4.4.0")
 
         self.assertTrue(report["compatibility"]["ready"])
+        self.assertEqual(256, report["router"]["memory_mb"])
+        self.assertEqual(228, report["router"]["usable_memory_mb"])
         visible_codes = {item["code"] for item in report["compatibility"]["checks"]}
         self.assertIn("memory", visible_codes)
         self.assertNotIn("package_manager", visible_codes)
@@ -320,6 +329,50 @@ class RouterControlTests(unittest.TestCase):
         self.assertNotIn("flash", visible_codes)
         self.assertNotIn("overlay", visible_codes)
         self.assertNotIn("overlay_writable", visible_codes)
+
+    def test_reserved_memory_is_presented_as_the_physical_router_class(self) -> None:
+        report = self.inspect(memory_kb=478 * 1024)
+
+        self.assertEqual(512, report["router"]["memory_mb"])
+        self.assertEqual(478, report["router"]["usable_memory_mb"])
+        visible_codes = {item["code"] for item in report["compatibility"]["checks"]}
+        self.assertNotIn("memory_recommended", visible_codes)
+
+    def test_overlay_writability_blocks_install_without_duplicating_the_visible_internet_check(self) -> None:
+        report = self.inspect(
+            missing_nikki=True,
+            nikki_init=0,
+            unmanaged_mihomo=True,
+            mihomo_runtime="unknown",
+            overlay_writable=0,
+        )
+
+        visible_codes = {item["code"] for item in report["compatibility"]["checks"]}
+        self.assertNotIn("package_manager", visible_codes)
+        self.assertNotIn("overlay_writable", visible_codes)
+        self.assertFalse(report["compatibility"]["install_ready"])
+        self.assertFalse(report["safety"]["install_enabled"])
+
+    def test_apk_only_openwrt_can_install_the_official_vpn_module(self) -> None:
+        report = self.inspect(
+            firmware="25.12.5",
+            opkg=0,
+            apk=1,
+            package_arch="aarch64_cortex-a53",
+            missing_nikki=True,
+            nikki_init=0,
+            unmanaged_mihomo=True,
+            mihomo_runtime="unknown",
+        )
+
+        self.assertEqual("apk", report["router"]["package_manager"])
+        self.assertTrue(report["compatibility"]["install_ready"])
+        self.assertTrue(report["safety"]["install_enabled"])
+        blockers = {item["code"] for item in report["compatibility"]["install_blockers"]}
+        self.assertNotIn("package_manager", blockers)
+        source = (TOOL_ROOT / "katovpn_router_setup" / "control.py").read_text(encoding="utf-8")
+        self.assertIn("DISTRIB_ARCH", source)
+        self.assertIn("apk list --installed --manifest", source)
 
     def test_clean_install_still_checks_free_space_but_not_physical_flash(self) -> None:
         report = self.inspect(
@@ -359,7 +412,7 @@ class RouterControlTests(unittest.TestCase):
         self.assertEqual("official_feed", primary["method"])
         self.assertEqual("pc_upload", fallback["method"])
         self.assertTrue(primary["dry_run_required"])
-        self.assertFalse(primary["hardware_validated"])
+        self.assertTrue(primary["hardware_validated"])
         commands = "\n".join(primary["commands"] + fallback["commands"])
         self.assertNotIn("opkg upgrade", commands)
         self.assertNotIn("apk upgrade", commands)
@@ -434,9 +487,11 @@ class RouterControlTests(unittest.TestCase):
         self.assertNotIn('name="subscription_url"', html.split('id="login-view"', 1)[1].split('id="app-view"', 1)[0])
         self.assertIn(".username-field, .password-field { grid-column: 1 / -1; }", css)
         self.assertNotIn('id="update-button"', html)
-        self.assertIn('["nikki", "mihomo", "adblock"]', script)
-        self.assertIn('setAttribute("data-update-component", key)', script)
-        self.assertIn("startUpdate(key)", script)
+        self.assertIn('title.textContent = "VPN-модуль"', script)
+        self.assertIn('sub.textContent = "Nikki, Mihomo Core"', script)
+        self.assertIn('startVpnAction', script)
+        self.assertIn('"/api/router/install-vpn"', script)
+        self.assertNotIn('["nikki", "mihomo", "adblock"]', script)
         self.assertNotIn('luci: "LuCI"', script)
         self.assertIn("subscription.url", script)
         self.assertNotIn("location_basis", script)
@@ -453,6 +508,8 @@ class RouterControlTests(unittest.TestCase):
         self.assertIn('id="router-password-form"', html)
         self.assertIn('item.status !== "block"', script)
         self.assertIn("formatRadioLabel", script)
+        self.assertIn("refreshDashboardAfterOperation", script)
+        self.assertIn("attempt < 5", script)
         self.assertIn("Разрешить подключение", html)
         self.assertIn("Завершить доступ", html)
         self.assertNotIn("Разрешить поддержку на 1 час", html + script)
@@ -516,6 +573,82 @@ class RouterControlTests(unittest.TestCase):
             self.assertIsNone(httpd.app_state.get_router_session())
         finally:
             server_module.inspect_router = original_inspect
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+            if thread is not None:
+                thread.join(timeout=2)
+
+    def test_local_api_starts_clean_vpn_install_with_the_staged_subscription(self) -> None:
+        original_inspect = server_module.inspect_router
+        original_install = server_module.install_router_vpn
+        captured: dict[str, object] = {}
+        dashboard = {
+            "connected": True,
+            "fingerprint": "SHA256:install-api-router",
+            "router": {"hostname": "unit-router"},
+            "internet": {"online": True},
+            "compatibility": {"install_ready": True, "checks": [], "blockers": [], "install_blockers": []},
+            "wifi": [],
+            "components": {"nikki": {"installed": False}, "mihomo": {"installed": False}},
+            "nikki": {},
+            "subscription": {"configured": False},
+            "backups": [],
+            "official_packages": {"status": "available"},
+            "safety": {"install_enabled": True},
+        }
+
+        def fake_install(spec: ConnectionSpec, fingerprint: str, **_kwargs: object) -> dict:
+            captured["subscription_url"] = spec.subscription_url
+            captured["fingerprint"] = fingerprint
+            return {"status": "success", "operation": "install", "packages_installed": True}
+
+        server_module.inspect_router = lambda _spec: dict(dashboard)
+        server_module.install_router_vpn = fake_install
+        httpd = None
+        thread = None
+        try:
+            httpd, url = server_module.run_server(open_browser=False)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            parsed = urllib.parse.urlsplit(url)
+            token = urllib.parse.parse_qs(parsed.query)["token"][0]
+            origin = f"http://{parsed.netloc}"
+
+            def post(path: str, payload: dict) -> dict:
+                request = urllib.request.Request(
+                    origin + path,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "X-Kato-Token": token, "Origin": origin},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            post("/api/router/login", {"host": "192.0.2.10", "port": 22, "username": "root", "password": "test-only"})
+            started = post(
+                "/api/router/install-vpn",
+                {"confirmed": True, "subscription_url": "https://subscribe.example.test/test-token"},
+            )
+            deadline = time.time() + 3
+            job = None
+            while time.time() < deadline:
+                request = urllib.request.Request(
+                    origin + f"/api/jobs/{started['job_id']}",
+                    headers={"X-Kato-Token": token, "Origin": origin},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    job = json.loads(response.read().decode("utf-8"))["job"]
+                if job["status"] not in {"queued", "running"}:
+                    break
+                time.sleep(0.02)
+
+            self.assertEqual("success", job["status"])
+            self.assertEqual("https://subscribe.example.test/test-token", captured["subscription_url"])
+            self.assertEqual("SHA256:install-api-router", captured["fingerprint"])
+        finally:
+            server_module.inspect_router = original_inspect
+            server_module.install_router_vpn = original_install
             if httpd is not None:
                 httpd.shutdown()
                 httpd.server_close()

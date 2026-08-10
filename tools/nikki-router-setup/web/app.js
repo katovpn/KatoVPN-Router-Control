@@ -389,25 +389,56 @@ function renderDashboard(report) {
   $("#lan-button").disabled = !safety.lan_changes_enabled;
   $("#router-password-button").disabled = !safety.password_change_enabled;
 
-  const labels = { nikki: "VPN-модуль Nikki", mihomo: "Ядро Mihomo", adblock: "Блокировка рекламы" };
-  $("#component-list").replaceChildren(...["nikki", "mihomo", "adblock"].map((key) => {
-    const component = report.components?.[key] || {};
+  const components = report.components || {};
+  const nikki = components.nikki || {};
+  const mihomo = components.mihomo || {};
+  const vpnInstalled = Boolean(nikki.installed && mihomo.installed);
+  const vpnUpdateAvailable = Boolean(nikki.update_available || mihomo.update_available);
+  const vpnRow = document.createElement("div");
+  vpnRow.className = "component-row";
+  const vpnMain = document.createElement("div");
+  vpnMain.className = "row-main";
+  const title = document.createElement("strong");
+  const sub = document.createElement("small");
+  title.textContent = "VPN-модуль";
+  sub.textContent = "Nikki, Mihomo Core";
+  vpnMain.append(title, sub);
+  const vpnSide = document.createElement("div");
+  vpnSide.className = "row-side";
+  const vpnStatus = document.createElement("span");
+  const vpnNeedsRepair = nikki.status === "runtime_missing" || mihomo.status === "runtime_missing";
+  vpnStatus.className = `component-status ${vpnInstalled && !vpnUpdateAvailable ? "current" : safety.install_enabled || vpnUpdateAvailable ? "available" : "missing"}`;
+  vpnStatus.textContent = vpnNeedsRepair
+    ? "Нужно восстановление"
+    : !vpnInstalled
+      ? safety.install_enabled ? "Доступен" : "Недоступен"
+      : vpnUpdateAvailable ? "Доступно обновление" : "Последняя версия";
+  vpnSide.append(vpnStatus);
+  if (!vpnInstalled || vpnUpdateAvailable) {
+    const vpnAction = document.createElement("button");
+    vpnAction.type = "button";
+    vpnAction.className = "positive-action";
+    vpnAction.textContent = vpnInstalled ? "Обновить" : "Установить";
+    vpnAction.disabled = !vpnInstalled && !safety.install_enabled;
+    vpnAction.addEventListener("click", startVpnAction);
+    vpnSide.append(vpnAction);
+  }
+  vpnRow.append(vpnMain, vpnSide);
+
+  const adblock = components.adblock || {};
+  const adblockRow = (() => {
+    const component = adblock;
     const row = document.createElement("div");
     row.className = "component-row";
     const main = document.createElement("div");
     main.className = "row-main";
     const title = document.createElement("strong");
     const sub = document.createElement("small");
-    title.textContent = labels[key];
-    if (key === "adblock") {
-      if (component.installed) sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
-      else if (!component.eligible) sub.textContent = "Опционально для роутеров класса 512 МБ";
-      else if (component.partial) sub.textContent = "Установлена только часть пакетов";
-      else sub.textContent = "AdBlock + панель LuCI + русский язык";
-    } else if (component.status === "runtime_missing") sub.textContent = `Пакет ${component.package_version || "установлен"}, но ядро не запускается`;
-    else if (!component.installed) sub.textContent = "Не установлен";
-    else if (key === "mihomo" && !component.managed) sub.textContent = `Версия ${component.version || "не определена"} · установлено вручную`;
-    else sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
+    title.textContent = "Блокировка рекламы";
+    if (component.installed) sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
+    else if (!component.eligible) sub.textContent = "Опционально для роутеров класса 512 МБ";
+    else if (component.partial) sub.textContent = "Установлена только часть пакетов";
+    else sub.textContent = "AdBlock + панель LuCI + русский язык";
     main.append(title, sub);
 
     const side = document.createElement("div");
@@ -422,36 +453,30 @@ function renderDashboard(report) {
         ? `Доступна ${component.latest}`
         : component.installed
           ? "Последняя версия"
-          : key === "adblock" && !component.eligible
+          : !component.eligible
             ? "Не рекомендуется"
-            : key === "adblock" ? "Доступен" : "Требуется установка";
+            : "Доступен";
     side.append(status);
 
-    if (key === "adblock" && (!component.installed || component.partial || component.update_available)) {
+    if (!component.installed || component.partial || component.update_available) {
       const action = document.createElement("button");
       action.type = "button";
-      action.setAttribute("data-update-component", key);
+      action.className = "positive-action";
       action.textContent = component.update_available ? "Обновить" : component.partial ? "Завершить" : "Установить";
       action.disabled = !safety.adblock_install_enabled;
       action.addEventListener("click", startAdblockInstall);
       side.append(action);
-    } else if (key !== "adblock" && component.update_available) {
-      const action = document.createElement("button");
-      action.type = "button";
-      action.setAttribute("data-update-component", key);
-      action.textContent = "Обновить";
-      action.addEventListener("click", () => startUpdate(key));
-      side.append(action);
     }
     row.append(main, side);
     return row;
-  }));
+  })();
+  $("#component-list").replaceChildren(vpnRow, adblockRow);
 
   $("#install-readiness").classList.toggle("hidden", !compatibility.installation_needed);
   $("#install-readiness").classList.toggle("ready", compatibility.install_ready);
   $("#install-readiness").textContent = compatibility.install_ready
-    ? "Роутер готов к установке VPN-модулей. Автоматическая чистая установка включится после аппаратного пилота."
-    : `Для установки нужно исправить: ${(compatibility.blockers || []).map((item) => item.title).join(", ") || "проверку совместимости"}.`;
+    ? "Роутер готов к установке VPN-модуля."
+    : `Для установки нужно исправить: ${(compatibility.install_blockers || compatibility.blockers || []).map((item) => item.title || item).join(", ") || "проверку совместимости"}.`;
 
   const backups = report.backups || [];
   $("#backup-list").replaceChildren(...(backups.length ? backups.map((backup) => {
@@ -491,18 +516,29 @@ function formatBackupId(id) {
   return `${match[3]}.${match[2]}.${match[1]} · ${match[4]}:${match[5]}`;
 }
 
-async function refreshDashboard({ quiet = false } = {}) {
+async function refreshDashboard({ quiet = false, silent = false } = {}) {
   const button = $("#refresh-button");
   if (!quiet) button.classList.add("busy");
   try {
     const payload = await api("/api/router/refresh", { method: "POST", body: "{}" });
     showApp(payload.router_session);
+    return true;
   } catch (error) {
     if (["router_session_required", "router_fingerprint_changed"].includes(error.payload?.code)) showLogin();
-    showError(error.message);
+    if (!silent) showError(error.message);
+    return false;
   } finally {
     button.classList.remove("busy");
   }
+}
+
+async function refreshDashboardAfterOperation() {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const refreshed = await refreshDashboard({ quiet: true, silent: attempt < 4 });
+    if (refreshed) return true;
+    await delay(750 * (attempt + 1));
+  }
+  return false;
 }
 
 function openOperation(title, message) {
@@ -527,6 +563,7 @@ function renderJob(job) {
       backup_delete: "Выбранная резервная копия удалена.",
       restore: "Настройки VPN восстановлены и проверены.",
       adblock_install: "AdBlock и русская панель управления установлены.",
+      install: "VPN-модуль и профиль KatoVPN установлены и проверены.",
       wifi_password: "Новый пароль Wi‑Fi подтверждён. Автоматический откат отменён.",
       wifi_create: "Новая Wi‑Fi сеть создана и подтверждена.",
       lan_ip: `Локальный адрес изменён на ${job.result?.new_ip}.`,
@@ -544,9 +581,12 @@ function renderJob(job) {
   } else if (job.status === "failed") {
     const details = job.error?.details || {};
     $("#operation-title").textContent = details.rolled_back ? "Изменение отменено" : "Операция не завершена";
-    $("#operation-message").textContent = details.rolled_back
+    const message = details.rolled_back
       ? `${job.error?.message || "Изменение не применено"} Предыдущие настройки восстановлены.`
       : job.error?.message || "Обновите сведения и проверьте состояние роутера.";
+    $("#operation-message").textContent = details.package_diagnostic
+      ? `${message} ${details.package_diagnostic}`
+      : message;
   }
 }
 
@@ -558,7 +598,7 @@ async function pollJob(jobId) {
     if (["queued", "running"].includes(payload.job.status)) {
       state.pollTimer = window.setTimeout(() => pollJob(jobId), 1000);
     } else {
-      await refreshDashboard({ quiet: true });
+      await refreshDashboardAfterOperation();
     }
   } catch (error) {
     showError(error.message);
@@ -576,16 +616,30 @@ async function startJob(path, body, title, message) {
   }
 }
 
-async function startUpdate(componentKey) {
-  const component = state.routerSession?.dashboard?.components?.[componentKey];
-  if (!component?.update_available) return showError("Для этого модуля нет совместимого обновления.");
-  const name = componentKey === "nikki" ? "Nikki" : "Mihomo";
-  if (!window.confirm(`Перед обновлением ${name} приложение создаст резервную копию настроек. Продолжить?`)) return;
+async function startVpnAction() {
+  const components = state.routerSession?.dashboard?.components || {};
+  const installed = Boolean(components.nikki?.installed && components.mihomo?.installed);
+  if (!installed) {
+    const subscriptionUrl = $("#subscription-url").value.trim();
+    if (!subscriptionUrl) return showError("Сначала укажите HTTPS-ссылку подписки.");
+    if (!window.confirm("Будут установлены официальный VPN-модуль и профиль KatoVPN. Перед изменением opkg выполнит проверку без установки. Продолжить?")) return;
+    startJob(
+      "/api/router/install-vpn",
+      { confirmed: true, subscription_url: subscriptionUrl },
+      "Установка VPN-модуля",
+      "Повторно проверяем роутер и официальный комплект пакетов."
+    );
+    return;
+  }
+  const updateNikki = Boolean(components.nikki?.update_available);
+  const updateMihomo = Boolean(components.mihomo?.update_available);
+  if (!updateNikki && !updateMihomo) return showError("VPN-модуль уже использует последние доступные версии.");
+  if (!window.confirm("Перед обновлением приложение создаст резервную копию настроек и обновит только устаревшие части VPN-модуля. Продолжить?")) return;
   startJob("/api/router/update-components", {
     confirmed: true,
-    update_nikki: componentKey === "nikki",
-    update_mihomo: componentKey === "mihomo",
-  }, `Обновление ${name}`, "Пакет будет загружен и проверен до изменения роутера.");
+    update_nikki: updateNikki,
+    update_mihomo: updateMihomo,
+  }, "Обновление VPN-модуля", "Будут обновлены только компоненты, для которых найдена новая версия.");
 }
 
 async function startAdblockInstall() {

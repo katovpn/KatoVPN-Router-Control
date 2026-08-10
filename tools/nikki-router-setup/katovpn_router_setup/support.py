@@ -140,6 +140,7 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
     marker = f"KatoVPN-Support-{session_id}"
     support_dir = f"{SUPPORT_ROOT}/{session_id}"
     cleanup = f"{support_dir}/cleanup.sh"
+    timer_pidfile = f"{support_dir}/timer.pid"
     session_shell = f"{support_dir}/session.sh"
     delay = max(1, expires_at - int(time.time()))
     return (
@@ -223,7 +224,8 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
         f"sed -i '\\|# {marker}$|d' {shlex.quote(SUPPORT_CRONTAB)}; "
         f"printf '%s\n' '* * * * * {cleanup} # {marker}' >> {shlex.quote(SUPPORT_CRONTAB)}; "
         "/etc/init.d/cron restart >/dev/null 2>&1; "
-        f"start-stop-daemon -S -b -x /bin/sh -- -c 'sleep {delay}; {cleanup} --force' >/dev/null 2>&1; "
+        f"start-stop-daemon -S -b -m -p {shlex.quote(timer_pidfile)} -x /bin/sh -- "
+        f"-c 'sleep {delay}; {cleanup} --force' >/dev/null 2>&1; "
         "rm -f /tmp/kato-support-key"
     )
 

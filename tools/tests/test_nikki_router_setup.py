@@ -32,6 +32,7 @@ from katovpn_router_setup.core import (  # noqa: E402
     validate_subscription_document,
     fetch_and_validate_subscription,
     restore_router_backup,
+    install_router_vpn,
     validate_backup_id,
 )
 
@@ -195,6 +196,8 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertIn("wireless.radio0.disabled='0'", apply)
         self.assertNotIn("correct horse", apply)
         self.assertIn("start-stop-daemon", rollback)
+        self.assertIn("-m -p", rollback)
+        self.assertIn("rollback.pid", rollback)
 
     def test_wifi_edit_preserves_password_when_blank(self) -> None:
         sessions: list[FakeSession] = []
@@ -370,6 +373,8 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertNotIn(self.spec.password, commands)
         self.assertIn("/etc/shadow", commands)
         self.assertIn("start-stop-daemon", commands)
+        self.assertIn("-m -p", commands)
+        self.assertIn("rollback.pid", commands)
         self.assertEqual(new_password, seen_specs[-1].password)
 
     def test_vpn_log_export_has_allowlisted_sources(self) -> None:
@@ -414,6 +419,40 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertNotIn("abcdef", clean)
         self.assertNotIn("control-secret", clean)
         self.assertIn("[скрыто]", clean)
+
+    def test_apk_failure_diagnostic_names_missing_packages_without_urls(self) -> None:
+        raw = (
+            "ERROR: unable to select packages:\n"
+            "  kmod-nft-tproxy (no such package):\n"
+            "    required by: nikki-2026.04.08-r1[kmod-nft-tproxy]\n"
+            "repository: https://packages.example.test/private/index.adb\n"
+            "__KATO_PACKAGE_EXIT__=1\n"
+        )
+
+        diagnostic = core_module.package_manager_failure_diagnostic(raw, "apk")
+
+        self.assertEqual("Репозитории роутера не предоставили пакеты: kmod-nft-tproxy.", diagnostic)
+        self.assertNotIn("packages.example.test", diagnostic)
+
+    def test_apk_failure_diagnostic_classifies_world_conflict(self) -> None:
+        raw = "ERROR: package-a-1.0 breaks: world[package-a=2.0]\n__KATO_PACKAGE_EXIT__=1"
+
+        diagnostic = core_module.package_manager_failure_diagnostic(raw, "apk")
+
+        self.assertEqual("Установленный набор пакетов конфликтует с новым VPN-модулем.", diagnostic)
+
+    def test_apk_failure_diagnostic_classifies_interrupted_tls_download(self) -> None:
+        raw = (
+            "wgetSSL error: error:00000001:lib(0)::reason(1)\n"
+            "ERROR: wget: exited with error 4\n"
+            "WARNING: fetching https://downloads.example.test/packages.adb: unexpected end of file\n"
+            "__KATO_PACKAGE_EXIT__=3\n"
+        )
+
+        diagnostic = core_module.package_manager_failure_diagnostic(raw, "apk")
+
+        self.assertEqual("Роутер не смог загрузить индекс или пакет из репозитория.", diagnostic)
+        self.assertNotIn("downloads.example.test", diagnostic)
 
     def test_backup_creation_and_exact_deletion_are_separate_operations(self) -> None:
         class BackupSession(FakeSession):
@@ -587,7 +626,8 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertIn('data-view="firmware"', html)
         self.assertIn('data-view="logs"', html)
         self.assertIn("Установленные модули", html)
-        self.assertIn("Ядро Mihomo", script)
+        self.assertIn("Nikki, Mihomo Core", script)
+        self.assertIn("/api/router/install-vpn", script)
         self.assertIn("/api/router/update-components", script)
         self.assertIn("/api/router/configure-subscription", script)
         self.assertIn("/api/router/install-adblock", script)
@@ -713,6 +753,195 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertIn("luci-app-nikki_1.26.1-r1_all.ipk", fake.commands["загрузка обновлений"])
         self.assertIn("запуск Nikki", fake.labels)
         self.assertIn("/etc/init.d/nikki start", fake.commands["запуск Nikki"])
+        self.assertIn("command -v netstat", fake.commands["DNS listener"])
+        self.assertIn("/proc/net/udp6", fake.commands["DNS listener"])
+
+    def test_clean_install_uses_official_exact_packages_before_configuring_profile(self) -> None:
+        class InstallSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                self.labels.append(label)
+                self.commands[label] = command
+                responses = {
+                    "сведения для установки VPN": json.dumps(
+                        {"release": {"distribution": "OpenWrt", "version": "24.10.2"}}
+                    ),
+                    "готовность установки VPN": (
+                        "uci=1\nfw4=1\nnft=1\nopkg=1\nmemory_kb=489472\n"
+                        "overlay_free_kb=98304\noverlay_writable=1\npackage_arch=aarch64_cortex-a53\n"
+                        "dns=1\nhttps=1\nfeed=1"
+                    ),
+                    "обновление списка пакетов VPN": "",
+                    "загрузка VPN-модуля": "",
+                    "проверка установки VPN": "__KATO_OPKG_EXIT__=0",
+                    "установка VPN-модуля": "",
+                    "проверка пакетов VPN": (
+                        "mihomo-meta=1.19.29\nnikki=2026.04.08-r1\nluci-app-nikki=1.26.1-r1"
+                    ),
+                    "проверка файлов VPN": "ready",
+                    "очистка установки VPN": "",
+                }
+                if label in responses:
+                    return responses[label]
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        install_session = InstallSession(self.spec)
+        configure_session = FakeSession(self.spec)
+        sessions = iter((install_session, configure_session))
+        result = install_router_vpn(
+            self.spec,
+            install_session.fingerprint,
+            session_factory=lambda _spec: next(sessions),
+            subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+            package_fetcher=lambda _firmware, _arch: {
+                "status": "available",
+                "url": "https://nikkinikki.pages.dev/openwrt-24.10/aarch64_cortex-a53/nikki/index.json",
+                "packages": {
+                    "nikki": "2026.04.08-r1",
+                    "luci-app-nikki": "1.26.1-r1",
+                    "mihomo-meta": "1.19.29",
+                },
+            },
+        )
+
+        self.assertEqual("install", result["operation"])
+        self.assertTrue(result["packages_installed"])
+        self.assertLess(install_session.labels.index("проверка установки VPN"), install_session.labels.index("установка VPN-модуля"))
+        self.assertIn("mihomo-meta_1.19.29_aarch64_cortex-a53.ipk", install_session.commands["загрузка VPN-модуля"])
+        self.assertIn("luci-app-nikki_1.26.1-r1_all.ipk", install_session.commands["загрузка VPN-модуля"])
+        self.assertIn("импорт настроек Nikki", configure_session.labels)
+
+    def test_clean_install_dry_run_failure_does_not_start_package_install(self) -> None:
+        class NoSpaceInstallSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                self.labels.append(label)
+                self.commands[label] = command
+                responses = {
+                    "сведения для установки VPN": json.dumps(
+                        {"release": {"distribution": "OpenWrt", "version": "24.10.2"}}
+                    ),
+                    "готовность установки VPN": (
+                        "uci=1\nfw4=1\nnft=1\nopkg=1\nmemory_kb=489472\n"
+                        "overlay_free_kb=98304\noverlay_writable=1\npackage_arch=aarch64_cortex-a53\n"
+                        "dns=1\nhttps=1\nfeed=1"
+                    ),
+                    "обновление списка пакетов VPN": "",
+                    "загрузка VPN-модуля": "",
+                    "проверка установки VPN": "Only have 12000kb available on filesystem, pkg needs 20000\n__KATO_OPKG_EXIT__=1",
+                    "очистка установки VPN": "",
+                }
+                if label in responses:
+                    return responses[label]
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        fake = NoSpaceInstallSession(self.spec)
+        with self.assertRaises(SetupError) as raised:
+            install_router_vpn(
+                self.spec,
+                fake.fingerprint,
+                session_factory=lambda _spec: fake,
+                subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+                package_fetcher=lambda _firmware, _arch: {
+                    "status": "available",
+                    "url": "https://nikkinikki.pages.dev/openwrt-24.10/aarch64_cortex-a53/nikki/index.json",
+                    "packages": {
+                        "nikki": "2026.04.08-r1",
+                        "luci-app-nikki": "1.26.1-r1",
+                        "mihomo-meta": "1.19.29",
+                    },
+                },
+            )
+
+        self.assertEqual("vpn_install_insufficient_space", raised.exception.code)
+        self.assertNotIn("установка VPN-модуля", fake.labels)
+
+    def test_clean_install_supports_openwrt_apk_with_official_repository_and_simulation(self) -> None:
+        class ApkInstallSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                self.labels.append(label)
+                self.commands[label] = command
+                responses = {
+                    "сведения для установки VPN": json.dumps(
+                        {"release": {"distribution": "OpenWrt", "version": "25.12.5"}}
+                    ),
+                    "готовность установки VPN": (
+                        "uci=1\nfw4=1\nnft=1\nopkg=0\napk=1\nmemory_kb=489472\n"
+                        "overlay_free_kb=98304\noverlay_writable=1\npackage_arch=aarch64_cortex-a53\n"
+                        "dns=1\nhttps=1\nfeed=1"
+                    ),
+                    "обновление списка пакетов VPN": "",
+                    "проверка установки VPN": "__KATO_PACKAGE_EXIT__=0",
+                    "установка VPN-модуля": "",
+                    "проверка пакетов VPN": (
+                        "mihomo-meta=1.19.29\nnikki=2026.04.08-r1\nluci-app-nikki=1.26.1-r1"
+                    ),
+                    "проверка файлов VPN": "ready",
+                    "очистка установки VPN": "",
+                }
+                if label in responses:
+                    return responses[label]
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        install_session = ApkInstallSession(self.spec)
+        configure_session = FakeSession(self.spec)
+        sessions = iter((install_session, configure_session))
+        result = install_router_vpn(
+            self.spec,
+            install_session.fingerprint,
+            session_factory=lambda _spec: next(sessions),
+            subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+            package_fetcher=lambda _firmware, _arch: {
+                "status": "available",
+                "url": "https://nikkinikki.pages.dev/openwrt-25.12/aarch64_cortex-a53/nikki/index.json",
+                "packages": {
+                    "nikki": "2026.04.08-r1",
+                    "luci-app-nikki": "1.26.1-r1",
+                    "mihomo-meta": "1.19.29",
+                },
+            },
+        )
+
+        self.assertEqual("install", result["operation"])
+        self.assertNotIn("загрузка VPN-модуля", install_session.labels)
+        self.assertIn("apk add --simulate --allow-untrusted --no-cache -X", install_session.commands["проверка установки VPN"])
+        self.assertIn("/packages.adb", install_session.commands["проверка установки VPN"])
+        self.assertIn("mihomo-meta nikki luci-app-nikki", install_session.commands["установка VPN-модуля"])
+        self.assertNotIn("opkg", install_session.commands["установка VPN-модуля"])
+
+    def test_component_update_supports_apk_and_updates_only_selected_packages(self) -> None:
+        class ApkUpdateSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                if label == "пакетный менеджер обновления":
+                    self.labels.append(label)
+                    self.commands[label] = command
+                    return "apk"
+                if label == "проверка установки обновлений":
+                    self.labels.append(label)
+                    self.commands[label] = command
+                    return "__KATO_PACKAGE_EXIT__=0"
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        fake = ApkUpdateSession(self.spec)
+        result = core_module.update_router_components(
+            self.spec,
+            fake.fingerprint,
+            update_nikki=True,
+            update_mihomo=False,
+            session_factory=lambda _spec: fake,
+            package_fetcher=lambda _firmware, _arch: {
+                "status": "available",
+                "url": "https://nikkinikki.pages.dev/openwrt-24.10/aarch64_cortex-a53/nikki/index.json",
+                "packages": {
+                    "nikki": "2026.04.08-r1",
+                    "luci-app-nikki": "1.26.1-r1",
+                    "mihomo-meta": "1.19.29",
+                },
+            },
+        )
+
+        self.assertEqual("1.26.1", result["component_updates"]["nikki"])
+        self.assertIn("apk add --simulate --allow-untrusted --no-cache -X", fake.commands["проверка установки обновлений"])
+        self.assertIn("nikki luci-app-nikki", fake.commands["установка Nikki"])
+        self.assertNotIn("mihomo-meta", fake.commands["установка Nikki"])
 
     def test_component_update_refuses_a_non_newer_official_version(self) -> None:
         class CurrentCoreSession(FakeSession):

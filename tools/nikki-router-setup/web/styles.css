@@ -143,13 +143,14 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .row-main small { color: var(--muted); font-size: 10px; }
 .row-side { display: flex; align-items: center; gap: 12px; color: #ccc8ca; font-size: 11px; }
 .row-side button { border: 0; color: var(--accent); background: transparent; cursor: pointer; font-size: 10px; }
+.row-side button.positive-action { color: var(--good); }
 .row-side button:disabled { color: var(--muted); cursor: default; opacity: .7; }
 .row-side .danger-action { color: var(--bad); }
 .backup-actions { flex-wrap: wrap; justify-content: flex-end; }
 .component-row { min-height: 76px; }
 .component-status { font-weight: 700; }
 .component-status.current { color: var(--good); }
-.component-status.available { color: var(--warn); }
+.component-status.available { color: var(--good); }
 .component-status.missing { color: var(--bad); }
 .preview-notice { display: flex; gap: 12px; margin-top: 18px; padding: 14px; border: 1px solid rgba(230,184,92,.18); border-radius: 10px; background: rgba(230,184,92,.05); }
 .preview-notice > i { width: 22px; height: 22px; display: grid; place-items: center; flex: 0 0 22px; border-radius: 50%; color: var(--warn); background: rgba(230,184,92,.12); font-style: normal; font-weight: 850; }

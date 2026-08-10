@@ -19,7 +19,7 @@
   },
   "subscription": {
     "included": false,
-    "user_agent": "mihomo KatoVPN-Router/1.0",
+    "user_agent": "katorouter-ru",
     "required_policy_targets": [
       "DIRECT",
       "⚡️ Авто",
