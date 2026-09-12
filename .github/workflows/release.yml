@@ -48,6 +48,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check tools/nikki-router-setup/web/app.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test tools/tests/test_setup_ui.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m compileall -q tools/nikki-router-setup/app.py tools/nikki-router-setup/katovpn_router_setup
 
       - name: Build portable executable

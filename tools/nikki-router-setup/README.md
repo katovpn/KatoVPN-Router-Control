@@ -6,12 +6,36 @@ Public download: `https://github.com/katovpn/KatoVPN-Router-Control/releases/tag
 
 ## Current interface
 
+### Automatic setup source candidate (unreleased)
+
+The primary subscription action is **Настроить**. It freshly checks the router,
+installs a missing VPN module or brings an existing Nikki installation to the
+KatoVPN configuration. A subscription URL alone is not proof that Nikki is
+configured correctly. Proven managed setups use the separate subscription refresh
+path without a package update. The assessment appears as generic setup status;
+protocol and service details belong in diagnostics.
+
+Active additional DNS/proxy services and nonstandard OpenWrt DNS settings produce
+a compatibility warning. Detection is conservative and does not establish that
+every additional service is a conflict, nor guarantee detection of arbitrary
+custom scripts. Setup does not edit third-party service configuration, DHCP,
+network or firewall UCI packages. Nikki settings are backed up before changes;
+settings rollback does not undo package installation.
+
+Individual router links use the exact `katorouter-ru` User-Agent for both desktop
+validation and Nikki refresh. The selected country remains owned by the server's
+device-link settings. A successful local setup verification does not by itself
+prove end-to-end connectivity from every LAN client. Physical-router acceptance
+and the existing release gates are still required before publishing this candidate.
+
+### Existing control surfaces
+
 - The welcome screen defaults to `192.168.11.1` and asks for router address, SSH port, username, and password.
 - **Home** shows OpenWrt compatibility, public IP, country flag, location/provider, and VPN subscription state/expiry checked from the installed HTTPS link. A valid 200+ MiB router receives the readiness point even when 512 MiB is still recommended.
 - **Internet** lists Wi-Fi access points with detected 2.4/5/6 GHz radio labels, can create an access point or edit its name, optional password, radio, and RU/CN country code, can change the private LAN IP, and can change the router administrator password with a two-minute router-side rollback.
-- **Maintenance** presents Nikki and Mihomo as one VPN module with one install/update action, keeps optional AdBlock separate, keeps the current subscription URL editable, provides the one-hour temporary KatoVPN support flow, and manages Nikki settings backups.
+- **Maintenance** presents Nikki and Mihomo as one VPN module, keeps package updates separate from automatic setup, keeps optional AdBlock separate, keeps the current subscription URL editable, provides the one-hour temporary KatoVPN support flow, and manages Nikki settings backups.
 - **Logs** combines Nikki App Log, Mihomo Core Log, and matching OpenWrt events into one sanitized VPN journal; the selected line count applies to each source. A separate button creates a diagnostic report as `.txt`.
-- An existing subscription URL can be replaced in place without package updates. If Nikki/Mihomo are absent, the URL is used by the clean-install action after validation.
+- An existing managed subscription URL can be replaced in place without package updates. Manual or drifted Nikki settings are normalized by automatic setup after backup; a clean router uses the same setup action to install the module.
 
 The local UI binds only to `127.0.0.1` and protects its API with a random in-memory token. SSH credentials and staged subscription URLs exist only in process memory until logout or application exit. The installed subscription URL is shown only inside that authenticated loopback session so it can be edited; it is not written to the app log or local disk.
 
@@ -82,4 +106,5 @@ The Windows executable cannot run on macOS. A future macOS `.app`/`.dmg` should 
 ```powershell
 python -m unittest discover -s tools/tests -p "test_*router*.py" -v
 node --check tools/nikki-router-setup/web/app.js
+node --test tools/tests/test_setup_ui.js
 ```

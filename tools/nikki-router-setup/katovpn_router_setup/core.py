@@ -20,9 +20,8 @@ import requests
 import yaml
 
 
-PROFILE_NAME = "KatoVPN - Router Russia"
+PROFILE_NAME = "KatoVPN Router"
 USER_AGENT = "katorouter-ru"
-REQUIRED_POLICY_TARGETS = {"DIRECT", "⚡️ Авто", "🇳🇱 Нидерланды"}
 MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024
 MIN_FREE_OVERLAY_KB = 512
 MIHOMO_ADOPTION_MIN_FREE_KB = 48 * 1024
@@ -463,36 +462,64 @@ def validate_subscription_document(raw: bytes) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise SetupError("invalid_subscription", "Сервер вернул не Mihomo YAML.")
 
-    proxies = document.get("proxies", []) or []
-    providers = document.get("proxy-providers", {}) or {}
+    proxies = document.get("proxies", [])
+    providers = document.get("proxy-providers", {})
+    groups = document.get("proxy-groups", [])
+    rules = document.get("rules", [])
+    if not isinstance(proxies, list) or not all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and bool(item.get("name"))
+        and isinstance(item.get("type"), str)
+        and bool(item.get("type"))
+        for item in proxies
+    ):
+        raise SetupError("invalid_subscription", "Список proxies в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(providers, Mapping) or not all(isinstance(item, Mapping) for item in providers.values()):
+        raise SetupError("invalid_subscription", "Список proxy-providers в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(groups, list) or not all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and bool(item.get("name"))
+        and isinstance(item.get("type"), str)
+        and bool(item.get("type"))
+        and all(
+            key not in item
+            or (
+                isinstance(item.get(key), list)
+                and all(isinstance(value, str) and bool(value) for value in item.get(key, []))
+            )
+            for key in ("proxies", "use")
+        )
+        for item in groups
+    ):
+        raise SetupError("invalid_subscription", "Список proxy-groups в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(rules, list) or not all(isinstance(item, str) and bool(item) for item in rules):
+        raise SetupError("invalid_subscription", "Список rules в Mihomo-профиле имеет неверный формат.")
     if not proxies and not providers:
         raise SetupError("invalid_subscription", "В подписке нет proxies или proxy-providers.")
 
-    tun = document.get("tun", {}) or {}
-    if isinstance(tun, Mapping) and bool(tun.get("enable", False)):
+    tun = document.get("tun", {})
+    if not isinstance(tun, Mapping):
+        raise SetupError("invalid_subscription", "Раздел tun в Mihomo-профиле имеет неверный формат.")
+    if bool(tun.get("enable", False)):
         raise SetupError("tun_profile", "Полученный профиль включает TUN, а этот мастер рассчитан на Redirect/TPROXY.")
 
-    proxy_names, group_names = _policy_names(document)
-    available_targets = proxy_names | group_names | {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"}
-    missing_targets = sorted(REQUIRED_POLICY_TARGETS - available_targets)
-    if missing_targets:
-        raise SetupError(
-            "profile_contract_mismatch",
-            "Профиль не содержит цели, на которые ссылаются правила KatoVPN.",
-            {"missing_targets": missing_targets},
-        )
+    _proxy_names, group_names = _policy_names(document)
 
-    dns = document.get("dns", {}) or {}
+    dns = document.get("dns", {})
+    if not isinstance(dns, Mapping):
+        raise SetupError("invalid_subscription", "Раздел dns в Mihomo-профиле имеет неверный формат.")
     return {
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "proxies_count": len(proxies) if isinstance(proxies, list) else 0,
         "proxy_providers_count": len(providers) if isinstance(providers, Mapping) else 0,
         "proxy_groups_count": len(group_names),
-        "rules_count": len(document.get("rules", []) or []),
-        "tun_enabled": bool(tun.get("enable", False)) if isinstance(tun, Mapping) else False,
-        "dns_enabled": bool(dns.get("enable", False)) if isinstance(dns, Mapping) else False,
-        "required_targets_ok": True,
+        "rules_count": len(rules),
+        "tun_enabled": bool(tun.get("enable", False)),
+        "dns_enabled": bool(dns.get("enable", False)),
+        "structure_ok": True,
     }
 
 
@@ -1742,6 +1769,7 @@ def _apply_command() -> str:
         f"uci set nikki.$sid.name={shlex.quote(PROFILE_NAME)}; "
         "uci set nikki.$sid.url=\"$(cat /tmp/kato-subscription-url)\"; "
         f"uci set nikki.$sid.user_agent={shlex.quote(USER_AGENT)}; "
+        "uci set nikki.$sid.kato_managed='1'; "
         "uci set nikki.$sid.prefer='remote'; "
         "uci set nikki.$sid.success='0'; "
         "uci set nikki.config.profile=\"subscription:$sid\"; "
@@ -2100,6 +2128,7 @@ def install_router_vpn(
     subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
     package_fetcher: Callable[[str, str | None], dict[str, Any]] = fetch_latest_nikki_packages,
     template_text: str | None = None,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Install the exact official Nikki/Mihomo package set, then configure KatoVPN."""
     progress("validate", "running", "Проверяем подписку и профиль до установки")
@@ -2319,6 +2348,7 @@ def install_router_vpn(
             subscription_fetcher=subscription_fetcher,
             package_fetcher=package_fetcher,
             template_text=template_text,
+            verify_setup=verify_setup,
         )
     except SetupError as exc:
         exc.details.setdefault("packages_installed", True)
@@ -2332,6 +2362,19 @@ def install_router_vpn(
     }
 
 
+def _validate_mihomo_runtime(session: RemoteSession) -> None:
+    result = session.run(
+        "bin=$(command -v mihomo 2>/dev/null || true); "
+        "if [ -z \"$bin\" ]; then for candidate in /usr/libexec/mihomo /usr/bin/mihomo; do "
+        "if [ -x \"$candidate\" ]; then bin=$candidate; break; fi; done; fi; "
+        "if [ -z \"$bin\" ]; then echo unavailable; "
+        "elif \"$bin\" -t -f /etc/nikki/run/config.yaml >/dev/null 2>&1; then echo valid; else echo invalid; fi",
+        label="проверка конфигурации Mihomo", timeout=90, check=False,
+    ).strip()
+    if result != "valid":
+        raise SetupError("mihomo_runtime_validation", "Mihomo не подтвердил конфигурацию.")
+
+
 def replace_router_subscription(
     spec: ConnectionSpec,
     expected_fingerprint: str,
@@ -2339,6 +2382,7 @@ def replace_router_subscription(
     progress: ProgressCallback = _noop_progress,
     session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
     subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Replace the URL of the active Nikki subscription without touching packages."""
     progress("validate", "running", "Проверяем новую ссылку подписки")
@@ -2444,10 +2488,13 @@ def replace_router_subscription(
                 "profile_verification",
                 "После смены ссылки Nikki выбрал другой профиль.",
             )
+        if verify_setup:
+            _validate_mihomo_runtime(session)
         progress("subscription", "done", "Ссылка подписки обновлена и проверена")
         return {
             "status": "success",
             "operation": "subscription",
+            **({"setup": verify_setup(session)} if verify_setup else {}),
             "subscription_id": sid,
             "backup_path": backup_dir,
             "components_changed": False,
@@ -2503,6 +2550,7 @@ def configure_router(
     template_text: str | None = None,
     update_nikki: bool = False,
     update_mihomo: bool = False,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     progress("validate", "running", "Повторно проверяем профиль перед изменением")
     subscription_fetcher(spec.subscription_url)
@@ -2575,6 +2623,7 @@ def configure_router(
         profile_info = validate_subscription_document(profile_raw)
         runtime_raw = session.read_file("/etc/nikki/run/config.yaml")
         runtime_info = validate_subscription_document(runtime_raw)
+        _validate_mihomo_runtime(session)
 
         nft = session.run("nft list table inet nikki 2>/dev/null", label="таблица nftables", timeout=20)
         if "chain lan_redirect" not in nft or "chain lan_tproxy" not in nft:
@@ -2608,6 +2657,7 @@ def configure_router(
         return {
             "status": "success",
             "profile_name": PROFILE_NAME,
+            **({"setup": verify_setup(session)} if verify_setup else {}),
             "user_agent": USER_AGENT,
             "backup_path": backup_dir,
             "active_profile": active,
@@ -2658,6 +2708,117 @@ def configure_router(
             except Exception:
                 pass
             session.close()
+
+
+def setup_router_vpn(
+    spec: ConnectionSpec,
+    expected_fingerprint: str,
+    *,
+    progress: ProgressCallback = _noop_progress,
+    session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
+    subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
+    package_fetcher: Callable[[str, str | None], dict[str, Any]] = fetch_latest_nikki_packages,
+) -> dict[str, Any]:
+    """Choose the safe setup path from a fresh, pinned assessment."""
+    from .setup import inspect_router_setup
+
+    def inspect_fresh() -> dict[str, Any]:
+        session = session_factory(spec)
+        try:
+            session.connect()
+            if not expected_fingerprint or not secrets.compare_digest(
+                session.fingerprint, str(expected_fingerprint)
+            ):
+                raise SetupError(
+                    "host_key_changed",
+                    "SSH-ключ роутера изменился после проверки. Настройка остановлена.",
+                )
+            return inspect_router_setup(session)
+        finally:
+            session.close()
+
+    progress("inspect", "running", "Повторно проверяем состояние настройки")
+    assessment = inspect_fresh()
+    action = str(assessment.get("action", "blocked"))
+    if assessment.get("state") == "unknown" or action == "blocked":
+        progress("inspect", "error", "Состояние настройки не удалось подтвердить")
+        raise SetupError(
+            "setup_assessment_unknown",
+            "Не удалось безопасно определить состояние настройки KatoVPN.",
+            {"assessment": assessment},
+        )
+    progress("inspect", "done", "Состояние настройки подтверждено")
+
+    def verify_setup(session: RemoteSession) -> dict[str, Any]:
+        # Execute inside the underlying operation's rollback boundary.
+        progress("verify", "running", "Подтверждаем итоговое состояние настройки")
+        try:
+            final = inspect_router_setup(session)
+        except Exception as exc:
+            raise SetupError("setup_verification_failed", "Не удалось подтвердить итоговое состояние KatoVPN.") from exc
+        if final.get("state") != "ready":
+            raise SetupError(
+                "setup_verification_failed", "Итоговое состояние KatoVPN не подтвердилось.",
+                {"setup_action": action, "assessment": final},
+            )
+        progress("verify", "done", "Настройка KatoVPN подтверждена")
+        return final
+
+    if action == "install":
+        operation_result = install_router_vpn(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            package_fetcher=package_fetcher,
+            verify_setup=verify_setup,
+        )
+    elif action == "configure":
+        operation_result = configure_router(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            package_fetcher=package_fetcher,
+            update_nikki=False,
+            update_mihomo=False,
+            verify_setup=verify_setup,
+        )
+    elif action == "refresh":
+        operation_result = replace_router_subscription(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            verify_setup=verify_setup,
+        )
+    else:
+        raise SetupError(
+            "setup_action_invalid",
+            "Автоматическая настройка остановлена из-за неизвестного действия.",
+        )
+
+    final_assessment = operation_result["setup"]
+
+    warnings_by_code: dict[str, dict[str, Any]] = {}
+    for item in [*assessment.get("warnings", []), *final_assessment.get("warnings", [])]:
+        if isinstance(item, Mapping) and isinstance(item.get("code"), str):
+            warnings_by_code[item["code"]] = dict(item)
+    return {
+        **operation_result,
+        "operation": "setup",
+        "setup_action": action,
+        "setup": final_assessment,
+        "warnings": list(warnings_by_code.values()),
+        "verification": {
+            "configuration": "verified",
+            "runtime": "verified",
+            "lan_connectivity": "not_tested",
+        },
+    }
 
 
 def restore_router_backup(

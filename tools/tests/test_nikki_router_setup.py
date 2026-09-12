@@ -16,6 +16,7 @@ sys.path.insert(0, str(TOOL_ROOT))
 
 import katovpn_router_setup.core as core_module  # noqa: E402
 import katovpn_router_setup.server as server_module  # noqa: E402
+from katovpn_router_setup.setup import inspect_router_setup  # noqa: E402
 
 from katovpn_router_setup.core import (  # noqa: E402
     ConnectionSpec,
@@ -54,6 +55,28 @@ rules:
   - MATCH,⚡️ Авто
 """.strip().encode("utf-8")
 
+READY_SETUP_FLAGS = "\n".join(
+    [
+        "evidence_version=1",
+        *(
+            f"{key}=1"
+            for key in (
+                "nikki_package", "luci_package", "mihomo_binary", "mihomo_valid", "nikki_init", "nikki_config",
+                "enabled", "active_subscription", "managed_marker", "managed_name", "managed_user_agent",
+                "tcp_redirect", "udp_tproxy", "ipv4_dns_hijack", "ipv6_proxy_disabled",
+                "tun_dns_hijack_disabled", "tproxy_mark", "dns_contract", "proxy_contract", "policy_contract",
+                "service_running", "mihomo_running", "nft_redirect", "nft_tproxy", "policy_routing",
+                "dns_listener", "subscription_file", "runtime_file", "runtime_config_valid",
+            )
+        ),
+        "external_services=",
+        "dnsmasq_forwarding=0",
+        "dhcp_dns=0",
+        "network_dns=0",
+        "dnsmasq_override=0",
+    ]
+)
+
 
 class FakeSession:
     def __init__(self, _spec: ConnectionSpec, *, fail_dns: bool = False, fail_restore_compare: bool = False):
@@ -87,6 +110,8 @@ class FakeSession:
             "policy routing": "1024: from all fwmark 0x80/0xff lookup 80",
             "DNS listener": "udp UNCONN 0 0 [::]:1053 [::]:*",
             "активный профиль": "subscription:cfg123abc",
+            "проверка конфигурации Mihomo": "valid",
+            "состояние автоматической настройки": READY_SETUP_FLAGS,
             "очистка временных файлов": "",
             "автоматический откат": "",
             "проверка backup": "1",
@@ -607,19 +632,25 @@ class NikkiRouterSetupTests(unittest.TestCase):
     def test_portable_template_has_working_no_tun_contract_and_no_secrets(self) -> None:
         text = profile_template_path().read_text(encoding="utf-8")
         result = validate_portable_template(text)
-        self.assertGreaterEqual(result["rules"], 20)
+        self.assertEqual(0, result["rules"])
         self.assertNotIn("config subscription", text)
         self.assertNotIn("api_secret", text)
         self.assertNotIn("option password", text)
         self.assertIn("option tcp_mode 'redirect'", text)
         self.assertIn("option udp_mode 'tproxy'", text)
+        self.assertNotIn("config nameserver", text)
+        self.assertNotIn("config nameserver_policy", text)
+        self.assertNotIn("223.5.5.5", text)
+        self.assertNotIn("option matcher", text)
+        self.assertNotIn("⚡️ Авто", text)
+        self.assertNotIn("Нидерланды", text)
 
     def test_ui_exposes_router_control_sections_and_safe_operations(self) -> None:
         html = (TOOL_ROOT / "web" / "index.html").read_text(encoding="utf-8")
         script = (TOOL_ROOT / "web" / "app.js").read_text(encoding="utf-8")
         self.assertIn("logo.png", html)
         self.assertTrue((TOOL_ROOT / "web" / "logo.png").is_file())
-        self.assertIn("Профиль KatoVPN", html)
+        self.assertIn("Настройка роутера", html)
         self.assertIn('id="login-view"', html)
         self.assertIn('data-view="home"', html)
         self.assertIn('data-view="internet"', html)
@@ -627,23 +658,36 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertIn('data-view="logs"', html)
         self.assertIn("Установленные модули", html)
         self.assertIn("Nikki, Mihomo Core", script)
-        self.assertIn("/api/router/install-vpn", script)
+        self.assertIn("/api/router/setup-vpn", script)
         self.assertIn("/api/router/update-components", script)
-        self.assertIn("/api/router/configure-subscription", script)
         self.assertIn("/api/router/install-adblock", script)
         self.assertIn("/api/router/export-logs", script)
         self.assertNotIn("Ссылка скрыта", script)
         self.assertNotIn("Ядро роутера", script)
 
-    def test_subscription_contract_requires_katovpn_policy_targets(self) -> None:
+    def test_subscription_contract_is_structural_and_does_not_require_country_targets(self) -> None:
         result = validate_subscription_document(VALID_PROFILE)
-        self.assertTrue(result["required_targets_ok"])
+        self.assertTrue(result["structure_ok"])
         self.assertFalse(result["tun_enabled"])
 
-        broken = VALID_PROFILE.replace("🇳🇱 Нидерланды".encode("utf-8"), b"Netherlands")
+        server_owned_names = VALID_PROFILE.replace("🇳🇱 Нидерланды".encode("utf-8"), b"Server Route")
+        server_owned_names = server_owned_names.replace("⚡️ Авто".encode("utf-8"), b"Automatic")
+        self.assertTrue(validate_subscription_document(server_owned_names)["structure_ok"])
+
+        broken = VALID_PROFILE.replace(b"proxy-groups:", b"proxy-groups: invalid\nignored:")
         with self.assertRaises(SetupError) as raised:
             validate_subscription_document(broken)
-        self.assertEqual("profile_contract_mismatch", raised.exception.code)
+        self.assertEqual("invalid_subscription", raised.exception.code)
+
+        malformed_documents = (
+            b"proxies:\n  - name: route\n    type: direct\nproxy-groups:\n  - type: select\nrules: []\n",
+            b"proxies:\n  - name: route\n    type: direct\ndns: []\nrules: []\n",
+        )
+        for malformed in malformed_documents:
+            with self.subTest(document=malformed):
+                with self.assertRaises(SetupError) as malformed_error:
+                    validate_subscription_document(malformed)
+                self.assertEqual("invalid_subscription", malformed_error.exception.code)
 
     def test_preflight_is_read_only_and_reports_nftables(self) -> None:
         fake = FakePreflightSession(self.spec)
@@ -730,6 +774,7 @@ class NikkiRouterSetupTests(unittest.TestCase):
             fake.fingerprint,
             session_factory=lambda _spec: fake,
             subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+            verify_setup=inspect_router_setup,
             package_fetcher=lambda _firmware, _arch: {
                 "status": "available",
                 "url": "https://nikkinikki.pages.dev/openwrt-24.10/aarch64_cortex-a53/nikki/index.json",
@@ -1425,13 +1470,81 @@ class NikkiRouterSetupTests(unittest.TestCase):
             fake.fingerprint,
             session_factory=lambda _spec: fake,
             subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+            verify_setup=inspect_router_setup,
         )
         self.assertEqual("success", result["status"])
         self.assertEqual(PROFILE_NAME, result["profile_name"])
         self.assertEqual(USER_AGENT, result["user_agent"])
+        self.assertEqual("ready", result["setup"]["state"])
         self.assertEqual(self.spec.subscription_url.encode(), fake.writes["/tmp/kato-subscription-url"])
         self.assertNotIn(self.spec.subscription_url.encode(), fake.writes["/tmp/kato-nikki-profile.uci"])
         self.assertNotIn("автоматический откат", fake.labels)
+
+    def test_configure_uses_mihomo_runtime_validation_when_available(self) -> None:
+        fake = FakeSession(self.spec)
+
+        configure_router(
+            self.spec,
+            fake.fingerprint,
+            session_factory=lambda _spec: fake,
+            subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+            verify_setup=inspect_router_setup,
+        )
+
+        command = fake.commands["проверка конфигурации Mihomo"]
+        self.assertIn('"$bin" -t -f /etc/nikki/run/config.yaml', command)
+        self.assertIn("/usr/libexec/mihomo /usr/bin/mihomo", command)
+
+    def test_invalid_mihomo_runtime_configuration_rolls_back(self) -> None:
+        class InvalidRuntimeSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                if label == "проверка конфигурации Mihomo":
+                    self.labels.append(label)
+                    self.commands[label] = command
+                    return "invalid"
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        fake = InvalidRuntimeSession(self.spec)
+        with self.assertRaises(SetupError) as raised:
+            configure_router(
+                self.spec,
+                fake.fingerprint,
+                session_factory=lambda _spec: fake,
+                subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+                verify_setup=inspect_router_setup,
+            )
+
+        self.assertEqual("mihomo_runtime_validation", raised.exception.code)
+        self.assertTrue(raised.exception.details["rolled_back"])
+
+    def test_final_setup_assessment_failure_is_inside_configuration_rollback(self) -> None:
+        class DriftedAssessmentSession(FakeSession):
+            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
+                if label == "состояние автоматической настройки":
+                    self.labels.append(label)
+                    self.commands[label] = command
+                    return READY_SETUP_FLAGS.replace("proxy_contract=1", "proxy_contract=0")
+                return super().run(command, label=label, timeout=timeout, check=check)
+
+        fake = DriftedAssessmentSession(self.spec)
+
+        def require_ready(session: FakeSession) -> dict:
+            assessment = inspect_router_setup(session)
+            if assessment["state"] != "ready":
+                raise SetupError("setup_verification_failed", "Итоговое состояние не подтверждено.")
+            return assessment
+
+        with self.assertRaises(SetupError) as raised:
+            configure_router(
+                self.spec,
+                fake.fingerprint,
+                session_factory=lambda _spec: fake,
+                subscription_fetcher=lambda _url: validate_subscription_document(VALID_PROFILE),
+                verify_setup=require_ready,
+            )
+
+        self.assertEqual("setup_verification_failed", raised.exception.code)
+        self.assertTrue(raised.exception.details["rolled_back"])
 
     def test_existing_subscription_url_is_replaced_in_place_without_package_updates(self) -> None:
         class ReplaceSession(FakeSession):

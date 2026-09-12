@@ -19,6 +19,7 @@ from .core import (
     SetupError,
     fetch_latest_nikki_packages,
 )
+from .setup import inspect_router_setup
 
 
 MIN_RAM_KB = 200 * 1024
@@ -606,7 +607,11 @@ def inspect_router(
                 ),
             },
         }
-        installation_needed = not components["nikki"]["installed"] or not components["mihomo"]["installed"]
+        setup = inspect_router_setup(session)
+        installation_needed = (
+            not components["nikki"]["installed"] or not components["mihomo"]["installed"]
+            or setup.get("action") == "install"
+        )
         checks, install_checks = _compatibility_checks(
             board,
             capacity,
@@ -678,6 +683,7 @@ def inspect_router(
                 "tun": nikki_state.get("tcp") == "tun" or nikki_state.get("udp") == "tun",
             },
             "subscription": subscription,
+            "setup": setup,
             "backups": _parse_backup_rows(backups_raw),
             "official_packages": {"status": official.get("status", "unavailable"), "branch": official.get("branch"), "versions": dict(package_versions)},
             "safety": {

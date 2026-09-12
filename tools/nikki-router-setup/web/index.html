@@ -143,12 +143,14 @@
         </div>
 
         <div class="section-block">
-          <div class="block-heading"><div><p class="eyebrow">Профиль KatoVPN</p><h2>VPN-подписка</h2></div><span id="subscription-profile-state" class="label">Не установлена</span></div>
+          <div class="block-heading"><div><p class="eyebrow">KatoVPN</p><h2>Настройка роутера</h2></div><span id="subscription-profile-state" class="label">Нужно проверить</span></div>
           <form id="subscription-form" class="inline-form">
             <label class="field"><span>Ссылка из личного кабинета</span><input id="subscription-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
-            <button id="subscription-button" class="button primary" type="submit"><span>Установить или обновить</span><b>→</b></button>
+            <button id="subscription-button" class="button primary" type="submit"><span>Настроить</span><b>→</b></button>
           </form>
-          <p id="subscription-action-note" class="muted">Если VPN-модули ещё не установлены, ссылка сохранится в текущей сессии и будет использована при установке.</p>
+          <p id="subscription-action-note" class="muted">Нужно настроить роутер для работы с KatoVPN.</p>
+          <div id="setup-warnings" class="setup-warnings hidden" role="status"></div>
+          <details id="setup-details" class="setup-details hidden"><summary>Технические сведения</summary><ul id="setup-details-list"></ul></details>
         </div>
 
         <div id="support-access" class="section-block support-access">
@@ -238,6 +240,7 @@
     <h2 id="operation-title">Выполняется</h2>
     <p id="operation-message" class="muted">Не закрывайте приложение.</p>
     <ol id="operation-steps" class="operation-steps"></ol>
+    <details id="operation-details" class="operation-details hidden"><summary>Технические сведения</summary><ul id="operation-details-list"></ul></details>
   </aside>
 
   <div id="error-banner" class="error-banner hidden" role="alert"><strong>Не удалось выполнить действие</strong><span id="error-message"></span></div>

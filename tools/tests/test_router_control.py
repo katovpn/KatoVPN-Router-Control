@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,7 +23,8 @@ from katovpn_router_setup.control import (  # noqa: E402
     parse_public_ip_info,
     summarize_subscription_document,
 )
-from katovpn_router_setup.core import ConnectionSpec  # noqa: E402
+from katovpn_router_setup.core import ConnectionSpec, SetupError  # noqa: E402
+import katovpn_router_setup.control as control_module  # noqa: E402
 import katovpn_router_setup.server as server_module  # noqa: E402
 from katovpn_router_setup.server import AppState  # noqa: E402
 
@@ -451,6 +453,24 @@ class RouterControlTests(unittest.TestCase):
         masked = mask_subscription_url("https://user.example.test:8443/token/path?secret=yes")
         self.assertEqual("https://user.example.test:8443/…", masked)
 
+    def test_dashboard_exposes_fresh_setup_assessment(self) -> None:
+        assessment = {"state": "needs_configuration", "action": "configure",
+                      "message": "Нужно настроить роутер для работы с KatoVPN",
+                      "warnings": [], "details": {}}
+        with patch.object(control_module, "inspect_router_setup", return_value=assessment, create=True) as probe:
+            result = self.inspect()
+        self.assertEqual(assessment, result.get("setup"))
+        self.assertEqual(1, probe.call_count)
+
+    def test_router_jobs_are_exclusive_until_previous_operation_finishes(self) -> None:
+        state = AppState()
+        first = state.create_job()
+        with self.assertRaises(SetupError) as raised:
+            state.create_job()
+        self.assertEqual("router_busy", raised.exception.code)
+        first.status = "failed"
+        self.assertNotEqual(first.id, state.create_job().id)
+
     def test_app_state_keeps_one_router_session_in_memory_and_forgets_it(self) -> None:
         state = AppState()
         state.save_router_session(self.spec, "SHA256:control-test-router", {"connected": True})
@@ -490,7 +510,7 @@ class RouterControlTests(unittest.TestCase):
         self.assertIn('title.textContent = "VPN-модуль"', script)
         self.assertIn('sub.textContent = "Nikki, Mihomo Core"', script)
         self.assertIn('startVpnAction', script)
-        self.assertIn('"/api/router/install-vpn"', script)
+        self.assertIn('"/api/router/setup-vpn"', script)
         self.assertNotIn('["nikki", "mihomo", "adblock"]', script)
         self.assertNotIn('luci: "LuCI"', script)
         self.assertIn("subscription.url", script)
@@ -756,6 +776,132 @@ class RouterControlTests(unittest.TestCase):
                 httpd.server_close()
             if thread is not None:
                 thread.join(timeout=2)
+
+
+class AutomaticSetupApiTests(unittest.TestCase):
+    def patched(self, name, **kwargs):
+        patcher = patch.object(server_module, name, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def setUp(self) -> None:
+        self.spec = ConnectionSpec("192.0.2.10", "root", "test-password", "", 22)
+        self.fingerprint = "SHA256:setup-api-test"
+        self.dashboard = {
+            "connected": True, "fingerprint": self.fingerprint,
+            "compatibility": {"ready": True, "install_ready": True, "blockers": []},
+            "components": {"nikki": {"installed": True}, "mihomo": {"installed": True}},
+            "subscription": {"configured": True},
+            "setup": {"state": "needs_configuration", "action": "configure", "warnings": []},
+        }
+        self.probe = self.patched("inspect_router", return_value=self.dashboard)
+        self.patched("preflight_router", side_effect=AssertionError("legacy preflight must not run"))
+        self.patched("fetch_and_validate_subscription", return_value={"tun_enabled": False})
+        self.setup = self.patched("setup_router_vpn", create=True,
+            return_value={"status": "success", "operation": "setup"})
+        self.httpd, url = server_module.run_server(open_browser=False)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        parsed = urllib.parse.urlsplit(url)
+        self.origin = f"http://{parsed.netloc}"
+        self.token = urllib.parse.parse_qs(parsed.query)["token"][0]
+        self.httpd.app_state.save_router_session(self.spec, self.fingerprint, self.dashboard)
+
+    def tearDown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+
+    def post(self, payload=None, *, path="/api/router/setup-vpn", authorized=True):
+        body = json.dumps(payload if payload is not None else {
+            "confirmed": True, "subscription_url": "https://setup.example.test/d/test-token"}).encode()
+        request = urllib.request.Request(self.origin + path,
+            data=body if authorized else b"",
+            headers={"Content-Type": "application/json", "Origin": self.origin,
+                     "X-Kato-Token": self.token if authorized else "invalid"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def finished_job(self, job_id):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            job = self.httpd.app_state.jobs[job_id].public()
+            if job["status"] not in {"queued", "running"}:
+                return job
+            time.sleep(0.01)
+        self.fail("setup job did not finish")
+
+    def test_setup_requires_authorization_confirmation_and_router_session(self) -> None:
+        self.assertEqual(403, self.post(authorized=False)[0])
+        self.assertEqual("confirmation_required", self.post({})[1]["error"]["code"])
+        self.httpd.app_state.clear_router_session()
+        self.assertEqual("router_session_required", self.post()[1]["error"]["code"])
+        self.setup.assert_not_called()
+
+    def test_manual_nikki_uses_automatic_setup_and_refreshes_saved_dashboard(self) -> None:
+        code, response = self.post()
+        self.assertEqual(202, code)
+        job = self.finished_job(response["job_id"])
+        self.assertEqual("success", job["status"])
+        args = self.setup.call_args.args
+        self.assertEqual(self.fingerprint, args[1])
+        self.assertEqual("https://setup.example.test/d/test-token", args[0].subscription_url)
+        self.assertGreaterEqual(self.probe.call_count, 2)
+        self.assertEqual("setup", job["result"]["operation"])
+        self.assertNotIn(self.spec.password, json.dumps(job))
+
+    def test_legacy_configure_endpoint_cannot_skip_manual_nikki_normalization(self) -> None:
+        code, response = self.post(path="/api/router/configure-subscription")
+        self.assertEqual(202, code)
+        self.assertEqual("success", self.finished_job(response["job_id"])["status"])
+        self.setup.assert_called_once()
+
+    def test_changed_identity_prevents_setup(self) -> None:
+        self.probe.return_value = {**self.dashboard, "fingerprint": "SHA256:other-router"}
+        code, response = self.post()
+        self.assertEqual(202, code)
+        job = self.finished_job(response["job_id"])
+        self.assertEqual("failed", job["status"])
+        self.assertEqual("router_fingerprint_changed", job["error"]["code"])
+        self.setup.assert_not_called()
+        self.assertIsNone(self.httpd.app_state.get_router_session())
+
+    def test_legacy_stale_missing_components_does_not_stage_over_manual_install(self) -> None:
+        stale = {**self.dashboard, "components": {}, "subscription": {"configured": False}}
+        self.httpd.app_state.save_router_session(self.spec, self.fingerprint, stale)
+        code, response = self.post(path="/api/router/configure-subscription")
+        self.assertEqual(202, code)
+        self.assertEqual("success", self.finished_job(response["job_id"])["status"])
+        self.setup.assert_called_once()
+
+    def test_legacy_staging_cannot_replace_link_during_running_job(self) -> None:
+        self.probe.return_value = {**self.dashboard, "components": {}}
+        self.httpd.app_state.create_job()
+        code, response = self.post(path="/api/router/configure-subscription")
+        self.assertEqual(400, code)
+        self.assertEqual("router_busy", response["error"]["code"])
+        self.assertEqual("", self.httpd.app_state.get_router_session()["staged_subscription_url"])
+
+    def test_setup_failure_is_reported_and_releases_busy_slot(self) -> None:
+        self.setup.side_effect = SetupError("setup_verification", "Настройка не завершена.")
+        code, response = self.post()
+        self.assertEqual(202, code)
+        job = self.finished_job(response["job_id"])
+        self.assertEqual("setup_verification", job["error"]["code"])
+        self.assertNotEqual(response["job_id"], self.httpd.app_state.create_job().id)
+
+    def test_stale_ready_dashboard_cannot_override_fresh_incompatibility(self) -> None:
+        self.probe.return_value = {**self.dashboard,
+            "compatibility": {"ready": False, "blockers": ["unsupported firmware"]}}
+        code, response = self.post()
+        self.assertEqual(202, code)
+        job = self.finished_job(response["job_id"])
+        self.assertEqual("router_incompatible", job["error"]["code"])
+        self.setup.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ const state = {
   browserSessionClosing: false,
   pollTimer: null,
   supportTimer: null,
+  activeOperation: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -295,6 +296,53 @@ function emptyRow(titleText, subtitleText) {
   return row;
 }
 
+function setupWarningText(warning) {
+  const code = String(warning?.code || "").toLowerCase();
+  if (code.includes("external") || code.includes("dns") || code.includes("proxy")) {
+    return "На роутере обнаружены дополнительные сетевые настройки. Они могут влиять на работу KatoVPN.";
+  }
+  return warning?.message || "Для работы KatoVPN требуется дополнительная проверка роутера.";
+}
+
+function renderSetup(setup) {
+  const labels = {
+    needs_install: "Нужно настроить",
+    needs_configuration: "Нужно настроить",
+    ready: "Готово",
+    needs_repair: "Требуется настройка",
+    unknown: "Нужно проверить",
+  };
+  const messages = {
+    needs_install: "Нужно настроить роутер для работы с KatoVPN.",
+    needs_configuration: "Нужно настроить роутер для работы с KatoVPN.",
+    ready: "Настройки KatoVPN проверены на роутере. Работа устройств в домашней сети требует отдельной проверки.",
+    needs_repair: "Нужно настроить роутер для работы с KatoVPN.",
+    unknown: "Состояние KatoVPN не удалось подтвердить. Проверьте роутер и настройте его заново.",
+  };
+  const current = setup || { state: "unknown", action: "blocked", warnings: [], details: {} };
+  const setupState = current.state in labels ? current.state : "unknown";
+  $("#subscription-profile-state").textContent = labels[setupState];
+  $("#subscription-profile-state").className = `label setup-${setupState}`;
+  $("#subscription-action-note").textContent = current.message || messages[setupState];
+  const warnings = Array.isArray(current.warnings) ? current.warnings : [];
+  $("#setup-warnings").classList.toggle("hidden", warnings.length === 0);
+  $("#setup-warnings").replaceChildren(...warnings.map((warning) => {
+    const item = document.createElement("p");
+    item.className = "setup-warning";
+    item.textContent = setupWarningText(warning);
+    return item;
+  }));
+  const details = current.details && typeof current.details === "object" ? current.details : {};
+  const entries = Object.entries(details).filter(([, value]) => value !== "" && value != null);
+  $("#setup-details").classList.toggle("hidden", entries.length === 0);
+  $("#setup-details-list").replaceChildren(...entries.map(([key, value]) => {
+    const item = document.createElement("li");
+    item.textContent = `${key}: ${Array.isArray(value) ? value.join(", ") : String(value)}`;
+    return item;
+  }));
+  $("#subscription-button").disabled = current.action === "blocked";
+}
+
 function renderDashboard(report) {
   const router = report.router || {};
   const internet = report.internet || {};
@@ -357,6 +405,7 @@ function renderDashboard(report) {
       ? "Ссылка сохранена. Установите VPN-модули, чтобы создать профиль KatoVPN."
       : "Подписка не обнаружена. Укажите актуальную ссылку из личного кабинета в разделе «Обслуживание».";
   if (document.activeElement !== $("#subscription-url")) $("#subscription-url").value = subscription.url || "";
+  renderSetup(report.setup);
 
   const wifi = report.wifi || [];
   $("#wifi-list").replaceChildren(...(wifi.length ? wifi.map((network) => {
@@ -414,7 +463,7 @@ function renderDashboard(report) {
       ? safety.install_enabled ? "Доступен" : "Недоступен"
       : vpnUpdateAvailable ? "Доступно обновление" : "Последняя версия";
   vpnSide.append(vpnStatus);
-  if (!vpnInstalled || vpnUpdateAvailable) {
+  if (vpnUpdateAvailable) {
     const vpnAction = document.createElement("button");
     vpnAction.type = "button";
     vpnAction.className = "positive-action";
@@ -545,13 +594,34 @@ function openOperation(title, message) {
   $("#operation-title").textContent = title;
   $("#operation-message").textContent = message;
   $("#operation-steps").replaceChildren();
+  $("#operation-details").classList.add("hidden");
+  $("#operation-details-list").replaceChildren();
   $("#operation-panel").classList.remove("hidden");
 }
 
 function renderJob(job) {
-  $("#operation-steps").replaceChildren(...(job.steps || []).map((step) => {
+  const isSetup = state.activeOperation === "setup" || job.result?.operation === "setup";
+  const setupPhase = {
+    connect: "Проверяем роутер.", inspect: "Проверяем роутер.", validate: "Проверяем данные KatoVPN.",
+    backup: "Создаём точку восстановления.", packages: "Подготавливаем KatoVPN.", component_update: "Подготавливаем KatoVPN.",
+    subscription: "Настраиваем KatoVPN.", upload: "Настраиваем KatoVPN.", apply: "Настраиваем KatoVPN.",
+    verify: "Проверяем результат.", rollback: "Восстанавливаем предыдущие настройки.", restore: "Восстанавливаем предыдущие настройки.",
+  };
+  const visibleSteps = isSetup
+    ? (job.steps || []).map((step) => ({
+        state: step.state,
+        message: setupPhase[step.id] || "Настраиваем KatoVPN.",
+      }))
+    : job.steps || [];
+  $("#operation-steps").replaceChildren(...visibleSteps.map((step) => {
     const item = document.createElement("li");
     item.className = step.state;
+    item.textContent = step.message;
+    return item;
+  }));
+  $("#operation-details").classList.toggle("hidden", !isSetup || !(job.steps || []).length);
+  $("#operation-details-list").replaceChildren(...(isSetup ? job.steps || [] : []).map((step) => {
+    const item = document.createElement("li");
     item.textContent = step.message;
     return item;
   }));
@@ -564,6 +634,7 @@ function renderJob(job) {
       restore: "Настройки VPN восстановлены и проверены.",
       adblock_install: "AdBlock и русская панель управления установлены.",
       install: "VPN-модуль и профиль KatoVPN установлены и проверены.",
+      setup: "Настройки KatoVPN проверены на роутере. Работа устройств в домашней сети требует отдельной проверки.",
       wifi_password: "Новый пароль Wi‑Fi подтверждён. Автоматический откат отменён.",
       wifi_create: "Новая Wi‑Fi сеть создана и подтверждена.",
       lan_ip: `Локальный адрес изменён на ${job.result?.new_ip}.`,
@@ -578,15 +649,38 @@ function renderJob(job) {
     } else {
       $("#operation-message").textContent = messages[operation] || "Операция завершена и проверена.";
     }
+    const warnings = [
+      ...(Array.isArray(job.result?.warnings) ? job.result.warnings : []),
+      ...(Array.isArray(job.result?.setup?.warnings) ? job.result.setup.warnings : []),
+    ];
+    if (operation === "setup" && warnings.length) {
+      $("#operation-message").textContent += ` ${warnings.map(setupWarningText).join(" ")}`;
+    }
+    state.activeOperation = null;
   } else if (job.status === "failed") {
     const details = job.error?.details || {};
     $("#operation-title").textContent = details.rolled_back ? "Изменение отменено" : "Операция не завершена";
-    const message = details.rolled_back
-      ? `${job.error?.message || "Изменение не применено"} Предыдущие настройки восстановлены.`
-      : job.error?.message || "Обновите сведения и проверьте состояние роутера.";
-    $("#operation-message").textContent = details.package_diagnostic
-      ? `${message} ${details.package_diagnostic}`
-      : message;
+    const packagesNote = details.packages_installed
+      ? " VPN-компоненты установлены, но настройка KatoVPN не завершена."
+      : "";
+    $("#operation-message").textContent = isSetup
+      ? (details.rolled_back ? `Настройка не завершена. Предыдущие настройки восстановлены.${packagesNote}` : `Настройка не завершена. Проверьте роутер и попробуйте снова.${packagesNote}`)
+      : (details.rolled_back ? `${job.error?.message || "Изменение не применено"} Предыдущие настройки восстановлены.` : job.error?.message || "Обновите сведения и проверьте состояние роутера.");
+    if (isSetup) {
+      const technical = [
+        ...(job.steps || []).map((step) => step.message),
+        ...(job.error?.code ? [`Код: ${job.error.code}`] : []),
+        ...(job.error?.message ? [job.error.message] : []),
+        ...(details.package_diagnostic ? [details.package_diagnostic] : []),
+      ];
+      $("#operation-details").classList.toggle("hidden", technical.length === 0);
+      $("#operation-details-list").replaceChildren(...technical.map((message) => {
+        const item = document.createElement("li");
+        item.textContent = message;
+        return item;
+      }));
+    }
+    state.activeOperation = null;
   }
 }
 
@@ -601,6 +695,7 @@ async function pollJob(jobId) {
       await refreshDashboardAfterOperation();
     }
   } catch (error) {
+    state.activeOperation = null;
     showError(error.message);
   }
 }
@@ -611,6 +706,7 @@ async function startJob(path, body, title, message) {
     const payload = await api(path, { method: "POST", body: JSON.stringify(body) });
     pollJob(payload.job_id);
   } catch (error) {
+    state.activeOperation = null;
     showError(error.message);
     $("#operation-panel").classList.add("hidden");
   }
@@ -619,18 +715,7 @@ async function startJob(path, body, title, message) {
 async function startVpnAction() {
   const components = state.routerSession?.dashboard?.components || {};
   const installed = Boolean(components.nikki?.installed && components.mihomo?.installed);
-  if (!installed) {
-    const subscriptionUrl = $("#subscription-url").value.trim();
-    if (!subscriptionUrl) return showError("Сначала укажите HTTPS-ссылку подписки.");
-    if (!window.confirm("Будут установлены официальный VPN-модуль и профиль KatoVPN. Перед изменением opkg выполнит проверку без установки. Продолжить?")) return;
-    startJob(
-      "/api/router/install-vpn",
-      { confirmed: true, subscription_url: subscriptionUrl },
-      "Установка VPN-модуля",
-      "Повторно проверяем роутер и официальный комплект пакетов."
-    );
-    return;
-  }
+  if (!installed) return showError("Укажите ссылку из личного кабинета и выберите «Настроить».");
   const updateNikki = Boolean(components.nikki?.update_available);
   const updateMihomo = Boolean(components.mihomo?.update_available);
   if (!updateNikki && !updateMihomo) return showError("VPN-модуль уже использует последние доступные версии.");
@@ -661,28 +746,14 @@ async function configureSubscription(event) {
   event.preventDefault();
   const url = $("#subscription-url").value.trim();
   if (!url) return showError("Введите HTTPS-ссылку подписки.");
-  const components = state.routerSession?.dashboard?.components || {};
-  const ready = Boolean(components.nikki?.installed && components.mihomo?.installed);
-  const confirmation = ready
-    ? "Приложение создаст резервную копию и установит или обновит профиль KatoVPN. Продолжить?"
-    : "VPN-модули ещё не установлены. Ссылка будет проверена и сохранена только в текущей сессии приложения. Продолжить?";
-  if (!window.confirm(confirmation)) return;
-  openOperation(ready ? "Обновление подписки" : "Сохранение ссылки", ready ? "Проверяем подписку и настройки VPN." : "Проверяем ссылку без изменения роутера.");
-  try {
-    const payload = await api("/api/router/configure-subscription", {
-      method: "POST", body: JSON.stringify({ confirmed: true, subscription_url: url }),
-    });
-    if (payload.status === "staged") {
-      showApp(payload.router_session);
-      $("#operation-title").textContent = "Ссылка сохранена";
-      $("#operation-message").textContent = "Роутер не изменён. Ссылка будет использована после установки VPN-модулей.";
-      return;
-    }
-    pollJob(payload.job_id);
-  } catch (error) {
-    showError(error.message);
-    $("#operation-panel").classList.add("hidden");
-  }
+  if (!window.confirm("Приложение создаст резервную копию при необходимости и приведёт настройки Nikki к KatoVPN. Продолжить?")) return;
+  state.activeOperation = "setup";
+  startJob(
+    "/api/router/setup-vpn",
+    { confirmed: true, subscription_url: url },
+    "Настройка KatoVPN",
+    "Проверяем состояние роутера и подготавливаем KatoVPN."
+  );
 }
 
 function openWifiDialog(action, network = null) {
