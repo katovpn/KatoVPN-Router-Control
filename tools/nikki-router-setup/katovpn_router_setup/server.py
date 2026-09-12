@@ -30,7 +30,6 @@ from .core import (
     create_nikki_backup,
     delete_nikki_backup,
     fetch_and_validate_subscription,
-    install_adblock,
     install_router_vpn,
     setup_router_vpn,
     preflight_router,
@@ -428,7 +427,7 @@ def make_handler(state: AppState):
                         "user_agent": USER_AGENT,
                         "implemented_modes": [
                             "dashboard", "configure", "update_only", "wifi_changes", "lan_ip",
-                            "router_password", "vpn_clean_install", "adblock", "backup_management", "log_export", "temporary_support",
+                            "router_password", "vpn_clean_install", "backup_management", "log_export", "temporary_support",
                         ],
                         "planned_modes": ["full_restore"],
                     }
@@ -737,22 +736,10 @@ def make_handler(state: AppState):
                     self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
                 if self.path == "/api/router/install-adblock":
-                    if payload.get("confirmed") is not True:
-                        raise SetupError("confirmation_required", "Подтвердите установку официальных пакетов AdBlock.")
-                    saved = state.get_router_session()
-                    if not saved:
-                        raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
-                    dashboard = saved.get("dashboard") if isinstance(saved.get("dashboard"), Mapping) else {}
-                    safety = dashboard.get("safety") if isinstance(dashboard.get("safety"), Mapping) else {}
-                    if not safety.get("adblock_install_enabled"):
-                        raise SetupError("adblock_install_unavailable", "AdBlock недоступен для ресурсов или текущего состояния этого роутера.")
-                    job = state.create_job()
-                    self._start_callable_job(
-                        job,
-                        "adblock",
-                        lambda: install_adblock(saved["spec"], str(saved["fingerprint"]), progress=job.progress),
+                    self._send_json(
+                        {"error": {"code": "not_found", "message": "Неизвестная операция."}},
+                        HTTPStatus.NOT_FOUND,
                     )
-                    self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
                 if self.path == "/api/router/create-backup":
                     if payload.get("confirmed") is not True:

@@ -46,8 +46,6 @@ BACKUP_ROOT = "/root/katovpn-nikki-backups"
 BACKUP_ID_PATTERN = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}(?:-[0-9a-f]{4})?$")
 ROUTER_ROLLBACK_ROOT = "/root/katovpn-router-rollbacks"
 NETWORK_ROLLBACK_SECONDS = 120
-ADBLOCK_MIN_RAM_KB = 448 * 1024
-ADBLOCK_PACKAGES = ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")
 MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024
 
 
@@ -1234,84 +1232,6 @@ def delete_nikki_backup(
             raise SetupError("backup_delete_failed", "Роутер не подтвердил удаление резервной копии.")
         progress("backup_delete", "done", "Резервная копия удалена")
         return {"operation": "backup_delete", "backup_id": backup_id}
-    finally:
-        session.close()
-
-
-def install_adblock(
-    spec: ConnectionSpec,
-    expected_fingerprint: str,
-    *,
-    progress: ProgressCallback = _noop_progress,
-    session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
-) -> dict[str, Any]:
-    session = _connect_pinned(spec, expected_fingerprint, session_factory)
-    package_text = " ".join(ADBLOCK_PACKAGES)
-    try:
-        progress("adblock", "running", "Проверяем ресурсы и официальные пакеты AdBlock")
-        state = _simple_key_values(
-            session.run(
-                "mem=$(awk '/MemTotal/ {print $2}' /proc/meminfo); printf 'memory_kb=%s\\n' \"${mem:-0}\"; "
-                "if command -v opkg >/dev/null 2>&1; then echo opkg=1; echo apk=0; "
-                "elif command -v apk >/dev/null 2>&1; then echo opkg=0; echo apk=1; "
-                "else echo opkg=0; echo apk=0; fi",
-                label="проверка AdBlock",
-                check=False,
-            )
-        )
-        try:
-            memory_kb = int(state.get("memory_kb", "0"))
-        except ValueError:
-            memory_kb = 0
-        if memory_kb < ADBLOCK_MIN_RAM_KB:
-            raise SetupError(
-                "adblock_memory",
-                "AdBlock доступен только для роутеров класса 512 МБ оперативной памяти.",
-                {"required_mb": ADBLOCK_MIN_RAM_KB // 1024, "detected_mb": memory_kb // 1024},
-            )
-        if state.get("opkg") == "1":
-            session.run("opkg update", label="обновление списка пакетов AdBlock", timeout=120)
-            availability = session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "opkg list \"$p\" 2>/dev/null | awk -v p=\"$p\" '$1==p {found=1} END {print p \"=\" (found?1:0)}'; done",
-                label="проверка доступности пакетов AdBlock",
-                check=False,
-            )
-            dry_run_command = f"opkg install --noaction {package_text}; rc=$?; echo __KATO_ADBLOCK_DRYRUN__=$rc; exit $rc"
-            install_command = f"opkg install {package_text}"
-        elif state.get("apk") == "1":
-            session.run("apk update", label="обновление списка пакетов AdBlock", timeout=120)
-            availability = session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "apk search -x \"$p\" 2>/dev/null | grep -q . && echo \"$p=1\" || echo \"$p=0\"; done",
-                label="проверка доступности пакетов AdBlock",
-                check=False,
-            )
-            dry_run_command = f"apk add --simulate {package_text}; rc=$?; echo __KATO_ADBLOCK_DRYRUN__=$rc; exit $rc"
-            install_command = f"apk add {package_text}"
-        else:
-            raise SetupError("package_manager_missing", "Не найден поддерживаемый пакетный менеджер OpenWrt.")
-        available = _simple_key_values(availability)
-        if any(available.get(package) != "1" for package in ADBLOCK_PACKAGES):
-            raise SetupError("adblock_packages_unavailable", "Официальные пакеты AdBlock недоступны для этой прошивки.")
-        dry_run = session.run(dry_run_command, label="проверка установки AdBlock", timeout=120)
-        if "__KATO_ADBLOCK_DRYRUN__=0" not in dry_run:
-            raise SetupError("adblock_dry_run", "Пакетный менеджер не подтвердил безопасную установку AdBlock.")
-        progress("adblock", "running", "Устанавливаем AdBlock и русскую панель управления")
-        session.run(install_command, label="установка AdBlock", timeout=180)
-        verified = _simple_key_values(
-            session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "if opkg status \"$p\" 2>/dev/null | grep -q '^Status: .* installed' || apk info -e \"$p\" >/dev/null 2>&1; "
-                "then echo \"$p=1\"; else echo \"$p=0\"; fi; done",
-                label="проверка AdBlock после установки",
-                check=False,
-            )
-        )
-        if any(verified.get(package) != "1" for package in ADBLOCK_PACKAGES):
-            raise SetupError("adblock_verification", "После установки не найдены все компоненты AdBlock.")
-        progress("adblock", "done", "AdBlock установлен")
-        return {"operation": "adblock_install", "packages": list(ADBLOCK_PACKAGES)}
     finally:
         session.close()
 

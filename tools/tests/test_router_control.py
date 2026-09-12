@@ -103,19 +103,6 @@ class FakeControlSession:
             ),
             "control-package-mihomo-alpha": "",
             "control-package-mihomo": "",
-            "control-package-adblock": (
-                "Package: adblock\nVersion: 4.4.2-r1\nArchitecture: all"
-                if self.overrides.get("adblock_installed") else ""
-            ),
-            "control-package-luci-app-adblock": (
-                "Package: luci-app-adblock\nVersion: 25.300.1\nArchitecture: all"
-                if self.overrides.get("adblock_installed") else ""
-            ),
-            "control-package-luci-i18n-adblock-ru": (
-                "Package: luci-i18n-adblock-ru\nVersion: 25.300.1\nArchitecture: all"
-                if self.overrides.get("adblock_installed") else ""
-            ),
-            "control-adblock-available": str(self.overrides.get("adblock_latest", "4.4.2-r1")),
             "control-mihomo-runtime": str(
                 self.overrides.get("mihomo_runtime", "Mihomo Meta v1.19.29 linux arm64")
             ),
@@ -421,28 +408,6 @@ class RouterControlTests(unittest.TestCase):
         self.assertIn("mihomo-meta", primary["packages"])
         self.assertIn("luci-app-nikki", primary["packages"])
 
-    def test_adblock_is_optional_and_only_eligible_on_512_mib_class_router(self) -> None:
-        small = self.inspect(memory_kb=256 * 1024)
-        large = self.inspect(memory_kb=512 * 1024)
-        installed = self.inspect(memory_kb=512 * 1024, adblock_installed=True)
-
-        self.assertFalse(small["components"]["adblock"]["eligible"])
-        self.assertTrue(large["components"]["adblock"]["eligible"])
-        self.assertFalse(large["components"]["adblock"]["installed"])
-        self.assertTrue(installed["components"]["adblock"]["installed"])
-        self.assertFalse(installed["components"]["adblock"]["partial"])
-
-    def test_adblock_reports_latest_version_and_available_updates(self) -> None:
-        current = self.inspect(memory_kb=512 * 1024, adblock_installed=True, adblock_latest="4.4.2-r1")
-        newer = self.inspect(memory_kb=512 * 1024, adblock_installed=True, adblock_latest="4.4.3-r1")
-
-        self.assertEqual("4.4.2-r1", current["components"]["adblock"]["latest"])
-        self.assertFalse(current["components"]["adblock"]["update_available"])
-        self.assertEqual("current", current["components"]["adblock"]["status"])
-        self.assertEqual("4.4.3-r1", newer["components"]["adblock"]["latest"])
-        self.assertTrue(newer["components"]["adblock"]["update_available"])
-        self.assertEqual("update_available", newer["components"]["adblock"]["status"])
-
     def test_wifi_actions_fail_closed_without_sae_mixed_support(self) -> None:
         report = self.inspect(wifi_sae=0)
 
@@ -461,6 +426,15 @@ class RouterControlTests(unittest.TestCase):
             result = self.inspect()
         self.assertEqual(assessment, result.get("setup"))
         self.assertEqual(1, probe.call_count)
+
+    def test_dashboard_does_not_manage_or_probe_adblock(self) -> None:
+        report = self.inspect()
+
+        self.assertNotIn("adblock", report["components"])
+        self.assertNotIn("adblock_install_enabled", report["safety"])
+        source = (TOOL_ROOT / "katovpn_router_setup" / "control.py").read_text(encoding="utf-8")
+        self.assertNotIn("control-package-adblock", source)
+        self.assertNotIn("control-adblock-available", source)
 
     def test_router_jobs_are_exclusive_until_previous_operation_finishes(self) -> None:
         state = AppState()
@@ -798,6 +772,7 @@ class AutomaticSetupApiTests(unittest.TestCase):
         self.probe = self.patched("inspect_router", return_value=self.dashboard)
         self.patched("preflight_router", side_effect=AssertionError("legacy preflight must not run"))
         self.patched("fetch_and_validate_subscription", return_value={"tun_enabled": False})
+        self.patched("install_adblock", create=True, side_effect=AssertionError("retired endpoint must not mutate router"))
         self.setup = self.patched("setup_router_vpn", create=True,
             return_value={"status": "success", "operation": "setup"})
         self.httpd, url = server_module.run_server(open_browser=False)
@@ -825,6 +800,14 @@ class AutomaticSetupApiTests(unittest.TestCase):
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
             return exc.code, json.load(exc)
+
+    def get(self, path: str):
+        request = urllib.request.Request(
+            self.origin + path,
+            headers={"Origin": self.origin, "X-Kato-Token": self.token},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
 
     def finished_job(self, job_id):
         deadline = time.monotonic() + 3
@@ -902,6 +885,18 @@ class AutomaticSetupApiTests(unittest.TestCase):
         job = self.finished_job(response["job_id"])
         self.assertEqual("router_incompatible", job["error"]["code"])
         self.setup.assert_not_called()
+
+    def test_retired_adblock_endpoint_is_not_found_and_creates_no_job(self) -> None:
+        jobs_before = dict(self.httpd.app_state.jobs)
+
+        code, response = self.post(path="/api/router/install-adblock")
+        meta_code, meta = self.get("/api/meta")
+
+        self.assertEqual(404, code)
+        self.assertEqual("not_found", response["error"]["code"])
+        self.assertEqual(jobs_before, self.httpd.app_state.jobs)
+        self.assertEqual(200, meta_code)
+        self.assertNotIn("adblock", meta["implemented_modes"])
 
 
 if __name__ == "__main__":

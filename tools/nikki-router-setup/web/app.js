@@ -474,52 +474,7 @@ function renderDashboard(report) {
   }
   vpnRow.append(vpnMain, vpnSide);
 
-  const adblock = components.adblock || {};
-  const adblockRow = (() => {
-    const component = adblock;
-    const row = document.createElement("div");
-    row.className = "component-row";
-    const main = document.createElement("div");
-    main.className = "row-main";
-    const title = document.createElement("strong");
-    const sub = document.createElement("small");
-    title.textContent = "Блокировка рекламы";
-    if (component.installed) sub.textContent = component.version ? `Версия ${component.version}` : "Версия не определена";
-    else if (!component.eligible) sub.textContent = "Опционально для роутеров класса 512 МБ";
-    else if (component.partial) sub.textContent = "Установлена только часть пакетов";
-    else sub.textContent = "AdBlock + панель LuCI + русский язык";
-    main.append(title, sub);
-
-    const side = document.createElement("div");
-    side.className = "row-side";
-    const status = document.createElement("span");
-    status.className = `component-status ${component.update_available ? "available" : component.installed ? "current" : "missing"}`;
-    status.textContent = component.status === "runtime_missing"
-      ? "Нужно восстановление"
-      : component.partial
-        ? "Нужно завершить"
-      : component.update_available
-        ? `Доступна ${component.latest}`
-        : component.installed
-          ? "Последняя версия"
-          : !component.eligible
-            ? "Не рекомендуется"
-            : "Доступен";
-    side.append(status);
-
-    if (!component.installed || component.partial || component.update_available) {
-      const action = document.createElement("button");
-      action.type = "button";
-      action.className = "positive-action";
-      action.textContent = component.update_available ? "Обновить" : component.partial ? "Завершить" : "Установить";
-      action.disabled = !safety.adblock_install_enabled;
-      action.addEventListener("click", startAdblockInstall);
-      side.append(action);
-    }
-    row.append(main, side);
-    return row;
-  })();
-  $("#component-list").replaceChildren(vpnRow, adblockRow);
+  $("#component-list").replaceChildren(vpnRow);
 
   $("#install-readiness").classList.toggle("hidden", !compatibility.installation_needed);
   $("#install-readiness").classList.toggle("ready", compatibility.install_ready);
@@ -632,7 +587,6 @@ function renderJob(job) {
       backup: "Резервная копия настроек VPN создана.",
       backup_delete: "Выбранная резервная копия удалена.",
       restore: "Настройки VPN восстановлены и проверены.",
-      adblock_install: "AdBlock и русская панель управления установлены.",
       install: "VPN-модуль и профиль KatoVPN установлены и проверены.",
       setup: "Настройки KatoVPN проверены на роутере. Работа устройств в домашней сети требует отдельной проверки.",
       wifi_password: "Новый пароль Wi‑Fi подтверждён. Автоматический откат отменён.",
@@ -725,21 +679,6 @@ async function startVpnAction() {
     update_nikki: updateNikki,
     update_mihomo: updateMihomo,
   }, "Обновление VPN-модуля", "Будут обновлены только компоненты, для которых найдена новая версия.");
-}
-
-async function startAdblockInstall() {
-  const component = state.routerSession?.dashboard?.components?.adblock || {};
-  const updating = Boolean(component.installed && component.update_available);
-  const confirmation = updating
-    ? "Перед обновлением AdBlock приложение создаст резервную копию настроек. Продолжить?"
-    : "Будут установлены три официальных пакета: AdBlock, панель LuCI и русский язык. Продолжить?";
-  if (!window.confirm(confirmation)) return;
-  startJob(
-    "/api/router/install-adblock",
-    { confirmed: true },
-    updating ? "Обновление AdBlock" : "Установка AdBlock",
-    "Сначала пакетный менеджер выполнит проверку без изменений."
-  );
 }
 
 async function configureSubscription(event) {

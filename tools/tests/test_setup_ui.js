@@ -3,6 +3,17 @@ const fs = require("node:fs");
 const test = require("node:test");
 const vm = require("node:vm");
 
+test("maintenance renders only VPN even when a legacy dashboard includes AdBlock", () => {
+  const { node, context } = loadApp(async () => ({ ok: true, json: async () => ({ router_session: null }) }));
+  vm.runInContext(`renderDashboard({ components: {
+    nikki: { installed: true }, mihomo: { installed: true },
+    adblock: { installed: true, eligible: true, update_available: true }
+  }, safety: { adblock_install_enabled: true } });`, context);
+  assert.equal(node("#component-list").children.length, 1);
+  assert.equal(node("#component-list").children[0].children[0].children[0].textContent, "VPN-модуль");
+  assert.equal(typeof context.startAdblockInstall, "undefined");
+});
+
 function element() {
   const listeners = {};
   const classes = new Set();

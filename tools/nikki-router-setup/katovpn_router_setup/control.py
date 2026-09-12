@@ -28,8 +28,6 @@ MIN_INSTALL_OVERLAY_KB = 64 * 1024
 SUPPORTED_DISTRIBUTIONS = {"openwrt", "immortalwrt"}
 HARDWARE_MUTATIONS_VALIDATED = False
 CLEAN_INSTALL_ENABLED = True
-ADBLOCK_CLASS_RAM_KB = 448 * 1024
-
 NIKKI_DEPENDENCIES = [
     "ca-bundle",
     "curl",
@@ -428,7 +426,6 @@ def inspect_router(
         packages: dict[str, dict[str, str]] = {}
         for package_name in (
             "nikki", "luci-app-nikki", "mihomo-meta", "mihomo-alpha", "mihomo",
-            "adblock", "luci-app-adblock", "luci-i18n-adblock-ru",
         ):
             raw = session.run(
                 "if command -v opkg >/dev/null 2>&1; then "
@@ -441,14 +438,6 @@ def inspect_router(
                 check=False,
             )
             packages.update(_package_blocks(raw))
-        adblock_available_raw = session.run(
-            "if command -v opkg >/dev/null 2>&1; then "
-            "opkg list adblock 2>/dev/null | awk '$1==\"adblock\" {print $3; exit}'; "
-            "elif command -v apk >/dev/null 2>&1; then "
-            "apk list --manifest -a adblock 2>/dev/null | awk '$1==\"adblock\" {print $2; exit}'; fi",
-            label="control-adblock-available",
-            check=False,
-        )
         mihomo_runtime_raw = session.run(
             "if command -v mihomo >/dev/null 2>&1; then mihomo -v 2>/dev/null | head -n 1; "
             "elif [ -x /usr/bin/mihomo ]; then /usr/bin/mihomo -v 2>/dev/null | head -n 1; "
@@ -555,14 +544,6 @@ def inspect_router(
         mihomo_latest = package_versions.get(mihomo_latest_package)
         nikki_update_available = bool(_semantic_version(nikki_latest) > _semantic_version(nikki_version))
         mihomo_update_available = bool(_semantic_version(mihomo_latest) > _semantic_version(mihomo_version))
-        adblock_installed = all(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru"))
-        adblock_partial = (
-            any(name in packages for name in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru"))
-            and not adblock_installed
-        )
-        adblock_version = (packages.get("adblock") or {}).get("Version")
-        adblock_latest = adblock_available_raw.strip().splitlines()[0] if adblock_available_raw.strip() else adblock_version
-        adblock_update_available = bool(_semantic_version(adblock_latest) > _semantic_version(adblock_version))
         components = {
             "nikki": {
                 "installed": capacity.get("nikki") == "1",
@@ -588,22 +569,6 @@ def inspect_router(
                     "current" if mihomo_runtime_version and mihomo_package_name else
                     "current_unmanaged" if mihomo_runtime_version else
                     "missing"
-                ),
-            },
-            "adblock": {
-                "installed": adblock_installed,
-                "partial": adblock_partial,
-                "version": adblock_version,
-                "latest": adblock_latest,
-                "update_available": adblock_update_available,
-                "eligible": _integer(capacity, "memory_kb") >= ADBLOCK_CLASS_RAM_KB,
-                "minimum_memory_mb": ADBLOCK_CLASS_RAM_KB // 1024,
-                "packages": ["adblock", "luci-app-adblock", "luci-i18n-adblock-ru"],
-                "status": (
-                    "update_available" if adblock_update_available else
-                    "current" if adblock_installed else
-                    "partial" if adblock_partial else
-                    "available"
                 ),
             },
         }
@@ -700,11 +665,6 @@ def inspect_router(
                     and lan_raw.get("shadow") == "1"
                 ),
                 "backup_management_enabled": components["nikki"]["installed"],
-                "adblock_install_enabled": (
-                    components["adblock"]["eligible"]
-                    and (not components["adblock"]["installed"] or components["adblock"]["update_available"])
-                    and internet.get("https") == "1"
-                ),
                 "log_export_enabled": components["nikki"]["installed"],
                 "full_restore_enabled": HARDWARE_MUTATIONS_VALIDATED,
             },

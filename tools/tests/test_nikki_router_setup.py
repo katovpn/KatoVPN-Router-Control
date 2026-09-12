@@ -509,33 +509,8 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertEqual("backup_delete", deleted["operation"])
         self.assertIn("/root/katovpn-nikki-backups/20260803-100000-deadbeef", deleted_session.commands["удаление backup"])
 
-    def test_adblock_install_uses_only_targeted_official_packages_and_dry_run(self) -> None:
-        class AdblockSession(FakeSession):
-            def run(self, command: str, *, label: str, timeout: int = 20, check: bool = True) -> str:
-                value = super().run(command, label=label, timeout=timeout, check=check)
-                return {
-                    "проверка AdBlock": "memory_kb=524288\nopkg=1\napk=0",
-                    "обновление списка пакетов AdBlock": "",
-                    "проверка доступности пакетов AdBlock": "adblock=1\nluci-app-adblock=1\nluci-i18n-adblock-ru=1",
-                    "проверка установки AdBlock": "__KATO_ADBLOCK_DRYRUN__=0",
-                    "установка AdBlock": "",
-                    "проверка AdBlock после установки": "adblock=1\nluci-app-adblock=1\nluci-i18n-adblock-ru=1",
-                }.get(label, value)
-
-        fake = AdblockSession(self.spec)
-        result = core_module.install_adblock(
-            self.spec,
-            fake.fingerprint,
-            session_factory=lambda _spec: fake,
-        )
-
-        self.assertEqual("adblock_install", result["operation"])
-        dry_run = fake.commands["проверка установки AdBlock"]
-        install = fake.commands["установка AdBlock"]
-        for package in ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru"):
-            self.assertIn(package, dry_run)
-            self.assertIn(package, install)
-        self.assertNotIn("opkg upgrade", "\n".join(fake.commands.values()))
+    def test_adblock_is_not_a_router_control_operation(self) -> None:
+        self.assertFalse(hasattr(core_module, "install_adblock"))
 
     def test_app_state_can_stage_subscription_without_touching_router(self) -> None:
         state = server_module.AppState()
@@ -660,7 +635,7 @@ class NikkiRouterSetupTests(unittest.TestCase):
         self.assertIn("Nikki, Mihomo Core", script)
         self.assertIn("/api/router/setup-vpn", script)
         self.assertIn("/api/router/update-components", script)
-        self.assertIn("/api/router/install-adblock", script)
+        self.assertNotIn("/api/router/install-adblock", script)
         self.assertIn("/api/router/export-logs", script)
         self.assertNotIn("Ссылка скрыта", script)
         self.assertNotIn("Ядро роутера", script)

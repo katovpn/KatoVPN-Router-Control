@@ -33,7 +33,7 @@ and the existing release gates are still required before publishing this candida
 - The welcome screen defaults to `192.168.11.1` and asks for router address, SSH port, username, and password.
 - **Home** shows OpenWrt compatibility, public IP, country flag, location/provider, and VPN subscription state/expiry checked from the installed HTTPS link. A valid 200+ MiB router receives the readiness point even when 512 MiB is still recommended.
 - **Internet** lists Wi-Fi access points with detected 2.4/5/6 GHz radio labels, can create an access point or edit its name, optional password, radio, and RU/CN country code, can change the private LAN IP, and can change the router administrator password with a two-minute router-side rollback.
-- **Maintenance** presents Nikki and Mihomo as one VPN module, keeps package updates separate from automatic setup, keeps optional AdBlock separate, keeps the current subscription URL editable, provides the one-hour temporary KatoVPN support flow, and manages Nikki settings backups.
+- **Maintenance** presents Nikki and Mihomo as one VPN module, keeps package updates separate from automatic setup, keeps the current subscription URL editable, provides the one-hour temporary KatoVPN support flow, and manages Nikki settings backups.
 - **Logs** combines Nikki App Log, Mihomo Core Log, and matching OpenWrt events into one sanitized VPN journal; the selected line count applies to each source. A separate button creates a diagnostic report as `.txt`.
 - An existing managed subscription URL can be replaced in place without package updates. Manual or drifted Nikki settings are normalized by automatic setup after backup; a clean router uses the same setup action to install the module.
 
@@ -56,9 +56,9 @@ The clean-install action reads the exact compatible versions from Nikki's offici
 
 ## Enabled operations and safety boundary
 
-The source pilot enables clean VPN-module installation, a unified targeted Nikki/Mihomo update action, installed-profile configuration, Wi-Fi creation and full access-point editing, private LAN IP changes, router administrator password changes, optional AdBlock installation, Nikki backup create/restore/delete, and sanitized log export. An existing Wi-Fi password is preserved when the edit form leaves the password empty; the app never reads it from the router. Wi-Fi, LAN, and router-password mutations require a pinned SSH fingerprint and arm a two-minute rollback on the router before applying the change; success is confirmed only after the app reconnects and verifies the new values.
+The source pilot enables clean VPN-module installation, a unified targeted Nikki/Mihomo update action, installed-profile configuration, Wi-Fi creation and full access-point editing, private LAN IP changes, router administrator password changes, Nikki backup create/restore/delete, and sanitized log export. An existing Wi-Fi password is preserved when the edit form leaves the password empty; the app never reads it from the router. Wi-Fi, LAN, and router-password mutations require a pinned SSH fingerprint and arm a two-minute rollback on the router before applying the change; success is confirmed only after the app reconnects and verifies the new values.
 
-AdBlock is optional and is offered only to a 512-MB-class router (at least 448 MiB reported by OpenWrt). The app refreshes package metadata, verifies all three official packages (`adblock`, `luci-app-adblock`, `luci-i18n-adblock-ru`), performs a dry run, and installs only those packages. It never runs a blanket package upgrade.
+Router Control does not manage AdBlock. Existing router-side ad blocking and third-party DNS services are left unchanged; network compatibility warnings remain available.
 
 Clean VPN-module installation is enabled in the source build for the representative-router pilot. Full OpenWrt backup/restore remains disabled until reboot and recovery behavior is validated. Package installation is not rolled back by a settings backup; if packages install but profile verification fails, the UI reports that distinction and leaves the verified packages available for a retry.
 
