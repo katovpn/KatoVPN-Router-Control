@@ -64,6 +64,8 @@ _MANAGED_FLAGS = (
     "managed_user_agent",
 )
 _CONFIGURATION_FLAGS = (
+    "active_subscription",
+    "managed_user_agent",
     "tcp_redirect",
     "udp_tproxy",
     "ipv4_dns_hijack",
@@ -101,6 +103,9 @@ _EXTERNAL_SERVICES = (
     "xray",
     "v2ray",
 )
+
+# Supplementary diagnostic flags do not change the core evidence contract.
+_DNS_DETAIL_FLAGS = ("dnsmasq_noresolv", "dnsmasq_dns_redirect", "dnsmasq_nonstandard_port")
 
 
 class SetupInspectionSession(Protocol):
@@ -187,6 +192,14 @@ def _probe_command() -> str:
             "test -n \"$dnsmasq_port\" && test \"$dnsmasq_port\" != 53; }"
         ),
     }
+    conditions.update({
+        "dnsmasq_noresolv": "test \"$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)\" = 1",
+        "dnsmasq_dns_redirect": "test \"$(uci -q get dhcp.@dnsmasq[0].dns_redirect 2>/dev/null)\" = 1",
+        "dnsmasq_nonstandard_port": (
+            "{ dnsmasq_port=$(uci -q get dhcp.@dnsmasq[0].port 2>/dev/null); "
+            "test -n \"$dnsmasq_port\" && test \"$dnsmasq_port\" != 53; }"
+        ),
+    })
     prefix = (
         "pkg_installed() { "
         "opkg status \"$1\" 2>/dev/null | grep -q '^Status: .* installed' || "
@@ -197,7 +210,7 @@ def _probe_command() -> str:
         "case \"$profile\" in subscription:*) sid=${profile#subscription:};; esac; "
         "case \"$sid\" in ''|*[!A-Za-z0-9_-]*) sid='';; esac; "
     )
-    flags = "; ".join(_flag_command(key, conditions[key]) for key in _BOOLEAN_FLAGS)
+    flags = "; ".join(_flag_command(key, conditions[key]) for key in (*_BOOLEAN_FLAGS, *_DNS_DETAIL_FLAGS))
     suffix = (
         "; external=''; for service in " + services + "; do "
         "if test -x /etc/init.d/$service && /etc/init.d/$service status >/dev/null 2>&1; then "
@@ -214,7 +227,9 @@ def _parse_probe(raw: str) -> tuple[dict[str, bool], list[str]] | None:
     external = [item for item in values.get("external_services", "").split(",") if item]
     if any(item not in _EXTERNAL_SERVICES for item in external):
         return None
-    return ({key: values[key] == "1" for key in _BOOLEAN_FLAGS}, sorted(set(external)))
+    if any(key in values and values[key] not in {"0", "1"} for key in _DNS_DETAIL_FLAGS):
+        return None
+    return ({key: values.get(key) == "1" for key in (*_BOOLEAN_FLAGS, *_DNS_DETAIL_FLAGS)}, sorted(set(external)))
 
 
 def inspect_router_setup(session: SetupInspectionSession) -> dict[str, Any]:
@@ -251,12 +266,14 @@ def inspect_router_setup(session: SetupInspectionSession) -> dict[str, Any]:
     component_count = sum(flags[key] for key in _COMPONENT_FLAGS)
     components = "absent" if component_count == 0 else "complete" if component_count == len(_COMPONENT_FLAGS) else "partial"
     managed = all(flags[key] for key in _MANAGED_FLAGS)
-    configuration_verified = managed and all(flags[key] for key in _CONFIGURATION_FLAGS)
-    runtime_verified = (
-        configuration_verified
-        and runtime_document_valid
-        and all(flags[key] for key in _RUNTIME_FLAGS)
-    )
+    # Ownership metadata is not evidence of compatibility (or incompatibility).
+    configuration_mismatches = [key for key in _CONFIGURATION_FLAGS if not flags[key]]
+    configuration_verified = not configuration_mismatches
+    runtime_mismatches = [key for key in _RUNTIME_FLAGS if not flags[key]]
+    if not runtime_document_valid:
+        runtime_mismatches.append("runtime_document_valid")
+    runtime_checks_passed = not runtime_mismatches
+    runtime_verified = configuration_verified and runtime_checks_passed
 
     warning_reasons: list[str] = []
     if external_services:
@@ -296,10 +313,14 @@ def inspect_router_setup(session: SetupInspectionSession) -> dict[str, Any]:
             "components": components,
             "managed": managed,
             "configuration_verified": configuration_verified,
+            "configuration_mismatches": configuration_mismatches,
             "runtime_verified": runtime_verified,
+            "runtime_checks_passed": runtime_checks_passed,
+            "runtime_mismatches": runtime_mismatches,
             "runtime_document_valid": runtime_document_valid,
             "external_services": external_services,
             "warning_reasons": warning_reasons,
+            "dnsmasq_options": [key for key in _DNS_DETAIL_FLAGS if flags[key]],
         },
     }
 
