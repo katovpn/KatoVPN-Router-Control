@@ -127,6 +127,8 @@ class RouterSupportTests(unittest.TestCase):
         self.assertIn("/etc/crontabs/root", install)
         self.assertIn("4102444800", install)
         self.assertIn("start-stop-daemon", install)
+        self.assertIn("-m -p", install)
+        self.assertIn("timer.pid", install)
         self.assertIn("session.sh", install)
         self.assertIn("timeout -s KILL", install)
         self.assertIn("SSH_ORIGINAL_COMMAND", install)

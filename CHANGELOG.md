@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — automatic KatoVPN setup
+
+- Remove AdBlock management from Router Control (UI, package inspection, installer, and API); leave existing router-side packages and third-party DNS settings unchanged.
+
+- Add one setup action for clean routers and manually installed Nikki, using a fresh assessment instead of treating any existing subscription as a managed KatoVPN configuration.
+- Recognize nonstandard external network settings read-only and show a general compatibility warning; setup does not rewrite third-party services or OpenWrt network settings.
+- Keep package updates separate, preserve configuration backups/rollback, and serialize router jobs across browser tabs.
+- Add automatic setup state and UI regression coverage to the GitHub checks.
+- Source candidate only: physical-router checks and release gates remain open; no new executable is included.
+
 ## v0.4.3-preview — 2026-08-06
 
 - Added HTTPS fallbacks for router public-IP, location, and provider detection.

@@ -30,7 +30,8 @@ from .core import (
     create_nikki_backup,
     delete_nikki_backup,
     fetch_and_validate_subscription,
-    install_adblock,
+    install_router_vpn,
+    setup_router_vpn,
     preflight_router,
     replace_router_subscription,
     resource_root,
@@ -139,6 +140,8 @@ class AppState:
         with self.lock:
             if not self.router_session:
                 raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
+            if self._has_active_jobs_locked():
+                raise SetupError("router_busy", "Дождитесь завершения текущей операции.")
             self.router_session["staged_subscription_url"] = url
             dashboard = dict(self.router_session.get("dashboard", {}))
             subscription = dict(dashboard.get("subscription", {})) if isinstance(dashboard.get("subscription"), Mapping) else {}
@@ -170,6 +173,15 @@ class AppState:
         self.support_manager.stop(reason="router_logout")
         with self.lock:
             self.router_session = None
+
+    def invalidate_router_session(self, created_at: float | None, fingerprint: str) -> None:
+        """Discard a changed identity without clearing a newer login."""
+        with self.lock:
+            current = self.router_session
+            if not current or current["created_at"] != created_at or not secrets.compare_digest(str(current["fingerprint"]), fingerprint):
+                return
+            self.router_session = None
+        self.support_manager.stop(reason="router_identity_changed")
 
     def save_preflight(self, spec: Any, report: Mapping[str, Any]) -> str:
         preflight_id = uuid.uuid4().hex
@@ -218,6 +230,8 @@ class AppState:
     def create_job(self) -> Job:
         job = Job(id=uuid.uuid4().hex)
         with self.lock:
+            if self._has_active_jobs_locked():
+                raise SetupError("router_busy", "Дождитесь завершения текущей операции.")
             self.jobs[job.id] = job
         return job
 
@@ -413,9 +427,9 @@ def make_handler(state: AppState):
                         "user_agent": USER_AGENT,
                         "implemented_modes": [
                             "dashboard", "configure", "update_only", "wifi_changes", "lan_ip",
-                            "router_password", "adblock", "backup_management", "log_export", "temporary_support",
+                            "router_password", "vpn_clean_install", "backup_management", "log_export", "temporary_support",
                         ],
-                        "planned_modes": ["hardware_validated_clean_install", "full_restore"],
+                        "planned_modes": ["full_restore"],
                     }
                 )
                 return
@@ -509,6 +523,45 @@ def make_handler(state: AppState):
                     support = state.support_manager.stop(reason="manual")
                     self._send_json({"support": support})
                     return
+                if self.path == "/api/router/install-vpn":
+                    if payload.get("confirmed") is not True:
+                        raise SetupError("confirmation_required", "Подтвердите установку VPN-модуля и профиля KatoVPN.")
+                    saved = state.get_router_session()
+                    if not saved:
+                        raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
+                    current = saved["spec"]
+                    spec = validate_inputs(
+                        {
+                            "host": current.host,
+                            "port": current.port,
+                            "username": current.username,
+                            "password": current.password,
+                            "subscription_url": payload.get("subscription_url", ""),
+                        },
+                        require_subscription=True,
+                    )
+                    dashboard = inspect_router(spec)
+                    if not secrets.compare_digest(str(saved["fingerprint"]), str(dashboard["fingerprint"])):
+                        state.clear_router_session()
+                        raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Войдите заново.")
+                    components = dashboard.get("components") if isinstance(dashboard.get("components"), Mapping) else {}
+                    nikki_ready = bool((components.get("nikki") or {}).get("installed")) if isinstance(components.get("nikki"), Mapping) else False
+                    mihomo_ready = bool((components.get("mihomo") or {}).get("installed")) if isinstance(components.get("mihomo"), Mapping) else False
+                    if nikki_ready and mihomo_ready:
+                        raise SetupError("vpn_already_installed", "VPN-модуль уже установлен. Обновите страницу для проверки версий.")
+                    safety = dashboard.get("safety") if isinstance(dashboard.get("safety"), Mapping) else {}
+                    if not safety.get("install_enabled"):
+                        compatibility = dashboard.get("compatibility") if isinstance(dashboard.get("compatibility"), Mapping) else {}
+                        raise SetupError(
+                            "vpn_install_unavailable",
+                            "Роутер пока не готов к безопасной установке VPN-модуля.",
+                            {"blockers": compatibility.get("install_blockers", [])},
+                        )
+                    state.stage_subscription(spec.subscription_url)
+                    job = state.create_job()
+                    self._start_vpn_install_job(job, spec, str(saved["fingerprint"]))
+                    self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
+                    return
                 if self.path == "/api/router/update-components":
                     if payload.get("confirmed") is not True:
                         raise SetupError("confirmation_required", "Подтвердите создание backup и обновление компонентов.")
@@ -535,9 +588,9 @@ def make_handler(state: AppState):
                     self._start_update_job(job, spec, str(saved["fingerprint"]), update_nikki, update_mihomo)
                     self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
-                if self.path == "/api/router/configure-subscription":
+                if self.path in {"/api/router/setup-vpn", "/api/router/configure-subscription"}:
                     if payload.get("confirmed") is not True:
-                        raise SetupError("confirmation_required", "Подтвердите создание backup и изменение подписки.")
+                        raise SetupError("confirmation_required", "Подтвердите настройку KatoVPN. Текущие настройки будут сохранены.")
                     saved = state.get_router_session()
                     if not saved:
                         raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
@@ -553,26 +606,21 @@ def make_handler(state: AppState):
                         require_subscription=True,
                     )
                     dashboard = saved.get("dashboard") if isinstance(saved.get("dashboard"), Mapping) else {}
+                    if self.path == "/api/router/configure-subscription":
+                        dashboard = inspect_router(spec)
+                        if not secrets.compare_digest(str(saved["fingerprint"]), str(dashboard.get("fingerprint", ""))):
+                            state.invalidate_router_session(saved["created_at"], str(saved["fingerprint"]))
+                            raise SetupError("router_fingerprint_changed", "Роутер изменился. Подключитесь заново.")
                     components = dashboard.get("components") if isinstance(dashboard.get("components"), Mapping) else {}
                     nikki_ready = bool((components.get("nikki") or {}).get("installed")) if isinstance(components.get("nikki"), Mapping) else False
                     mihomo_ready = bool((components.get("mihomo") or {}).get("installed")) if isinstance(components.get("mihomo"), Mapping) else False
-                    if not (nikki_ready and mihomo_ready):
+                    if self.path == "/api/router/configure-subscription" and not (nikki_ready and mihomo_ready):
                         fetch_and_validate_subscription(spec.subscription_url)
                         state.stage_subscription(spec.subscription_url)
                         self._send_json({"status": "staged", "router_session": state.public_router_session()})
                         return
-                    report = preflight_router(spec, check_subscription=True)
-                    if not secrets.compare_digest(str(saved["fingerprint"]), str(report["fingerprint"])):
-                        state.clear_router_session()
-                        raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Войдите заново.")
-                    if not report.get("compatible"):
-                        raise SetupError("router_incompatible", "Настройка заблокирована проверкой совместимости.", {"blockers": report.get("blockers", [])})
                     job = state.create_job()
-                    subscription = dashboard.get("subscription") if isinstance(dashboard.get("subscription"), Mapping) else {}
-                    if subscription.get("configured"):
-                        self._start_subscription_job(job, spec, str(saved["fingerprint"]))
-                    else:
-                        self._start_apply_job(job, spec, str(saved["fingerprint"]), False, False)
+                    self._start_setup_job(job, spec, str(saved["fingerprint"]))
                     self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
                 if self.path == "/api/router/wifi":
@@ -688,22 +736,10 @@ def make_handler(state: AppState):
                     self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
                 if self.path == "/api/router/install-adblock":
-                    if payload.get("confirmed") is not True:
-                        raise SetupError("confirmation_required", "Подтвердите установку официальных пакетов AdBlock.")
-                    saved = state.get_router_session()
-                    if not saved:
-                        raise SetupError("router_session_required", "Сначала подключитесь к роутеру.")
-                    dashboard = saved.get("dashboard") if isinstance(saved.get("dashboard"), Mapping) else {}
-                    safety = dashboard.get("safety") if isinstance(dashboard.get("safety"), Mapping) else {}
-                    if not safety.get("adblock_install_enabled"):
-                        raise SetupError("adblock_install_unavailable", "AdBlock недоступен для ресурсов или текущего состояния этого роутера.")
-                    job = state.create_job()
-                    self._start_callable_job(
-                        job,
-                        "adblock",
-                        lambda: install_adblock(saved["spec"], str(saved["fingerprint"]), progress=job.progress),
+                    self._send_json(
+                        {"error": {"code": "not_found", "message": "Неизвестная операция."}},
+                        HTTPStatus.NOT_FOUND,
                     )
-                    self._send_json({"job_id": job.id}, HTTPStatus.ACCEPTED)
                     return
                 if self.path == "/api/router/create-backup":
                     if payload.get("confirmed") is not True:
@@ -865,6 +901,66 @@ def make_handler(state: AppState):
             threading.Thread(target=runner, name=f"kato-{thread_name}-{job.id[:8]}", daemon=True).start()
 
         @staticmethod
+        def _start_setup_job(job: Job, spec: ConnectionSpec, fingerprint: str) -> None:
+            origin_session = state.get_router_session()
+            session_created_at = origin_session["created_at"] if origin_session else None
+
+            def runner() -> None:
+                job.status = "running"
+                job.updated_at = time.time()
+                outcome = "failed"
+                try:
+                    job.progress("inspect", "running", "Проверяем роутер")
+                    dashboard = inspect_router(spec)
+                    if not secrets.compare_digest(fingerprint, str(dashboard.get("fingerprint", ""))):
+                        state.invalidate_router_session(session_created_at, fingerprint)
+                        raise SetupError("router_fingerprint_changed", "Роутер изменился. Подключитесь заново.")
+                    compatibility = dashboard.get("compatibility", {})
+                    if not compatibility.get("ready"):
+                        raise SetupError("router_incompatible", "Автоматическая настройка пока недоступна.",
+                                         {"blockers": compatibility.get("blockers", [])})
+                    assessment = dashboard.get("setup", {})
+                    if assessment.get("action") == "install" and not compatibility.get("install_ready"):
+                        raise SetupError("vpn_install_unavailable", "Автоматическая настройка пока недоступна.",
+                                         {"blockers": compatibility.get("install_blockers", [])})
+                    job.result = setup_router_vpn(spec, fingerprint, progress=job.progress)
+                    outcome = "success"
+                except SetupError as exc:
+                    job.error = exc.as_dict()
+                    if exc.code in {"host_key_changed", "router_fingerprint_changed"}:
+                        state.invalidate_router_session(session_created_at, fingerprint)
+                except Exception:
+                    job.error = {"code": "unexpected", "message": "Не удалось завершить настройку KatoVPN.", "details": {}}
+                finally:
+                    # Do not resurrect a logged-out session or replace another router's dashboard.
+                    saved = state.get_router_session()
+                    if saved and saved["created_at"] == session_created_at and secrets.compare_digest(str(saved["fingerprint"]), fingerprint):
+                        refresh_spec = saved["spec"]
+                    else:
+                        refresh_spec = None
+                    if refresh_spec is not None:
+                        try:
+                            refreshed = inspect_router(refresh_spec)
+                            if secrets.compare_digest(str(refreshed.get("fingerprint", "")), fingerprint):
+                                with state.lock:
+                                    current = state.router_session
+                                    if current and current["created_at"] == session_created_at and current["spec"] == refresh_spec and secrets.compare_digest(str(current["fingerprint"]), fingerprint):
+                                        current["dashboard"] = refreshed
+                                        if outcome == "success":
+                                            current["staged_subscription_url"] = ""
+                            else:
+                                state.invalidate_router_session(session_created_at, fingerprint)
+                                if job.result is not None:
+                                    job.result["dashboard_refresh_pending"] = True
+                        except Exception:
+                            if job.result is not None:
+                                job.result["dashboard_refresh_pending"] = True
+                    job.status = outcome
+                    job.updated_at = time.time()
+
+            threading.Thread(target=runner, name=f"kato-setup-{job.id[:8]}", daemon=True).start()
+
+        @staticmethod
         def _start_apply_job(
             job: Job,
             spec: Any,
@@ -984,6 +1080,31 @@ def make_handler(state: AppState):
                     job.updated_at = time.time()
 
             threading.Thread(target=runner, name=f"nikki-update-{job.id[:8]}", daemon=True).start()
+
+        @staticmethod
+        def _start_vpn_install_job(job: Job, spec: Any, fingerprint: str) -> None:
+            local_spec = spec
+
+            def runner() -> None:
+                job.status = "running"
+                job.updated_at = time.time()
+                try:
+                    job.result = install_router_vpn(
+                        local_spec,
+                        fingerprint,
+                        progress=job.progress,
+                    )
+                    job.status = "success"
+                except SetupError as exc:
+                    job.error = exc.as_dict()
+                    job.status = "failed"
+                except Exception:
+                    job.error = {"code": "unexpected", "message": "Установка VPN-модуля остановлена из-за непредвиденной ошибки.", "details": {}}
+                    job.status = "failed"
+                finally:
+                    job.updated_at = time.time()
+
+            threading.Thread(target=runner, name=f"nikki-install-{job.id[:8]}", daemon=True).start()
 
     return Handler
 

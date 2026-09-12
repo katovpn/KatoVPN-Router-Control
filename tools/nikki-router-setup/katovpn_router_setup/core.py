@@ -20,12 +20,25 @@ import requests
 import yaml
 
 
-PROFILE_NAME = "KatoVPN - Router Russia"
-USER_AGENT = "mihomo KatoVPN-Router/1.0"
-REQUIRED_POLICY_TARGETS = {"DIRECT", "⚡️ Авто", "🇳🇱 Нидерланды"}
+PROFILE_NAME = "KatoVPN Router"
+USER_AGENT = "katorouter-ru"
 MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024
 MIN_FREE_OVERLAY_KB = 512
 MIHOMO_ADOPTION_MIN_FREE_KB = 48 * 1024
+VPN_INSTALL_MIN_RAM_KB = 200 * 1024
+VPN_INSTALL_MIN_OVERLAY_KB = 64 * 1024
+VPN_INSTALL_DEPENDENCIES = (
+    "ca-bundle",
+    "curl",
+    "yq",
+    "firewall4",
+    "ip-full",
+    "kmod-inet-diag",
+    "kmod-nft-socket",
+    "kmod-nft-tproxy",
+    "kmod-tun",
+    "kmod-dummy",
+)
 NIKKI_RELEASE_API = "https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest"
 NIKKI_RELEASE_PAGE = "https://github.com/nikkinikki-org/OpenWrt-nikki/releases/latest"
 NIKKI_FEED_BASE = "https://nikkinikki.pages.dev"
@@ -33,8 +46,6 @@ BACKUP_ROOT = "/root/katovpn-nikki-backups"
 BACKUP_ID_PATTERN = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}(?:-[0-9a-f]{4})?$")
 ROUTER_ROLLBACK_ROOT = "/root/katovpn-router-rollbacks"
 NETWORK_ROLLBACK_SECONDS = 120
-ADBLOCK_MIN_RAM_KB = 448 * 1024
-ADBLOCK_PACKAGES = ("adblock", "luci-app-adblock", "luci-i18n-adblock-ru")
 MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024
 
 
@@ -201,6 +212,7 @@ def build_wifi_rollback_command(operation_id: str) -> str:
     rollback_dir = f"{ROUTER_ROLLBACK_ROOT}/{operation_id}"
     marker = f"{rollback_dir}/confirmed"
     script = f"{rollback_dir}/rollback-wifi.sh"
+    pidfile = f"{rollback_dir}/rollback.pid"
     return (
         f"mkdir -p {shlex.quote(rollback_dir)}; cp -f /etc/config/wireless {shlex.quote(rollback_dir + '/wireless')}; "
         f"cat > {shlex.quote(script)} <<'KATO_ROLLBACK'\n"
@@ -213,7 +225,8 @@ def build_wifi_rollback_command(operation_id: str) -> str:
         "rm -f /tmp/kato-wifi-key /tmp/kato-wifi-ssid\n"
         f"rm -rf {shlex.quote(rollback_dir)}\n"
         "KATO_ROLLBACK\n"
-        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -x /bin/sh -- {shlex.quote(script)}"
+        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -m -p {shlex.quote(pidfile)} "
+        f"-x /bin/sh -- {shlex.quote(script)}"
     )
 
 
@@ -275,6 +288,7 @@ def build_lan_rollback_command(operation_id: str) -> str:
     rollback_dir = f"{ROUTER_ROLLBACK_ROOT}/{operation_id}"
     marker = f"{rollback_dir}/confirmed"
     script = f"{rollback_dir}/rollback-lan.sh"
+    pidfile = f"{rollback_dir}/rollback.pid"
     return (
         f"mkdir -p {shlex.quote(rollback_dir)}; cp -f /etc/config/network {shlex.quote(rollback_dir + '/network')}; "
         f"cat > {shlex.quote(script)} <<'KATO_ROLLBACK'\n"
@@ -286,7 +300,8 @@ def build_lan_rollback_command(operation_id: str) -> str:
         "fi\n"
         f"rm -rf {shlex.quote(rollback_dir)}\n"
         "KATO_ROLLBACK\n"
-        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -x /bin/sh -- {shlex.quote(script)}"
+        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -m -p {shlex.quote(pidfile)} "
+        f"-x /bin/sh -- {shlex.quote(script)}"
     )
 
 
@@ -295,6 +310,7 @@ def build_router_password_rollback_command(operation_id: str) -> str:
     rollback_dir = f"{ROUTER_ROLLBACK_ROOT}/{operation_id}"
     marker = f"{rollback_dir}/confirmed"
     script = f"{rollback_dir}/rollback-password.sh"
+    pidfile = f"{rollback_dir}/rollback.pid"
     return (
         f"mkdir -p {shlex.quote(rollback_dir)}; chmod 700 {shlex.quote(rollback_dir)}; "
         f"cp -p /etc/shadow {shlex.quote(rollback_dir + '/shadow')}; "
@@ -307,7 +323,8 @@ def build_router_password_rollback_command(operation_id: str) -> str:
         "rm -f /tmp/kato-router-password\n"
         f"rm -rf {shlex.quote(rollback_dir)}\n"
         "KATO_ROLLBACK\n"
-        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -x /bin/sh -- {shlex.quote(script)}"
+        f"chmod 700 {shlex.quote(script)}; start-stop-daemon -S -b -m -p {shlex.quote(pidfile)} "
+        f"-x /bin/sh -- {shlex.quote(script)}"
     )
 
 
@@ -324,6 +341,59 @@ def sanitize_diagnostic_text(value: str, *, extra_secrets: list[str] | tuple[str
         text,
     )
     return text
+
+
+def package_manager_failure_diagnostic(value: str, manager: str) -> str:
+    """Return a short, sanitized explanation for a failed package dry run."""
+    raw = sanitize_diagnostic_text(value)
+    raw = re.sub(r"(?m)^__KATO_(?:PACKAGE|OPKG)_EXIT__=\d+\s*$", "", raw)
+    compact = "\n".join(line.strip() for line in raw.splitlines() if line.strip())
+    lowered = compact.lower()
+
+    missing: list[str] = []
+    if manager == "apk":
+        missing.extend(re.findall(r"(?im)^\s*([A-Za-z0-9][A-Za-z0-9+_.-]*)\s*\(no such package\)", compact))
+        missing.extend(re.findall(r"(?im)^(?:ERROR:\s*)?unable to select packages?:?\s*([A-Za-z0-9][A-Za-z0-9+_.-]*)?", compact))
+    else:
+        missing.extend(re.findall(r"(?im)unknown package ['\"]?([A-Za-z0-9][A-Za-z0-9+_.-]*)", compact))
+        missing.extend(re.findall(r"(?im)cannot find package\s+([A-Za-z0-9][A-Za-z0-9+_.-]*)", compact))
+    missing = sorted({item for item in missing if item})
+
+    if "not enough space" in lowered or "no space left" in lowered or "only have" in lowered:
+        return "На системном разделе недостаточно свободного места для выбранных пакетов."
+    if any(
+        marker in lowered
+        for marker in (
+            "temporary error",
+            "network error",
+            "connection timed out",
+            "bad address",
+            "download error",
+            "wgetssl error",
+            "unexpected end of file",
+            "exited with error 4",
+        )
+    ):
+        return "Роутер не смог загрузить индекс или пакет из репозитория."
+    if missing:
+        return "Репозитории роутера не предоставили пакеты: " + ", ".join(missing[:8]) + "."
+    if any(marker in lowered for marker in ("untrusted signature", "signature verification failed", "public key not found")):
+        return "Пакетный менеджер не смог подтвердить подпись репозитория."
+    if any(marker in lowered for marker in ("breaks: world[", "conflicts:", "conflicting packages", "solver error")):
+        return "Установленный набор пакетов конфликтует с новым VPN-модулем."
+    if "unable to select packages" in lowered:
+        return "Пакетный менеджер не смог подобрать совместимый комплект зависимостей."
+    if not compact:
+        return "Пакетный менеджер завершил проверку с ошибкой без пояснения."
+
+    # Package-manager output does not contain the subscription or SSH password,
+    # but sanitize it anyway and keep only a small tail suitable for the local UI.
+    tail = compact.splitlines()[-6:]
+    summary = " ".join(tail)
+    summary = re.sub(r"\s+", " ", summary).strip()
+    if len(summary) > 600:
+        summary = summary[:597].rstrip() + "…"
+    return f"Ответ {manager}: {summary}"
 
 
 def validate_portable_template(text: str) -> dict[str, Any]:
@@ -390,36 +460,64 @@ def validate_subscription_document(raw: bytes) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise SetupError("invalid_subscription", "Сервер вернул не Mihomo YAML.")
 
-    proxies = document.get("proxies", []) or []
-    providers = document.get("proxy-providers", {}) or {}
+    proxies = document.get("proxies", [])
+    providers = document.get("proxy-providers", {})
+    groups = document.get("proxy-groups", [])
+    rules = document.get("rules", [])
+    if not isinstance(proxies, list) or not all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and bool(item.get("name"))
+        and isinstance(item.get("type"), str)
+        and bool(item.get("type"))
+        for item in proxies
+    ):
+        raise SetupError("invalid_subscription", "Список proxies в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(providers, Mapping) or not all(isinstance(item, Mapping) for item in providers.values()):
+        raise SetupError("invalid_subscription", "Список proxy-providers в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(groups, list) or not all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and bool(item.get("name"))
+        and isinstance(item.get("type"), str)
+        and bool(item.get("type"))
+        and all(
+            key not in item
+            or (
+                isinstance(item.get(key), list)
+                and all(isinstance(value, str) and bool(value) for value in item.get(key, []))
+            )
+            for key in ("proxies", "use")
+        )
+        for item in groups
+    ):
+        raise SetupError("invalid_subscription", "Список proxy-groups в Mihomo-профиле имеет неверный формат.")
+    if not isinstance(rules, list) or not all(isinstance(item, str) and bool(item) for item in rules):
+        raise SetupError("invalid_subscription", "Список rules в Mihomo-профиле имеет неверный формат.")
     if not proxies and not providers:
         raise SetupError("invalid_subscription", "В подписке нет proxies или proxy-providers.")
 
-    tun = document.get("tun", {}) or {}
-    if isinstance(tun, Mapping) and bool(tun.get("enable", False)):
+    tun = document.get("tun", {})
+    if not isinstance(tun, Mapping):
+        raise SetupError("invalid_subscription", "Раздел tun в Mihomo-профиле имеет неверный формат.")
+    if bool(tun.get("enable", False)):
         raise SetupError("tun_profile", "Полученный профиль включает TUN, а этот мастер рассчитан на Redirect/TPROXY.")
 
-    proxy_names, group_names = _policy_names(document)
-    available_targets = proxy_names | group_names | {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"}
-    missing_targets = sorted(REQUIRED_POLICY_TARGETS - available_targets)
-    if missing_targets:
-        raise SetupError(
-            "profile_contract_mismatch",
-            "Профиль не содержит цели, на которые ссылаются правила KatoVPN.",
-            {"missing_targets": missing_targets},
-        )
+    _proxy_names, group_names = _policy_names(document)
 
-    dns = document.get("dns", {}) or {}
+    dns = document.get("dns", {})
+    if not isinstance(dns, Mapping):
+        raise SetupError("invalid_subscription", "Раздел dns в Mihomo-профиле имеет неверный формат.")
     return {
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "proxies_count": len(proxies) if isinstance(proxies, list) else 0,
         "proxy_providers_count": len(providers) if isinstance(providers, Mapping) else 0,
         "proxy_groups_count": len(group_names),
-        "rules_count": len(document.get("rules", []) or []),
-        "tun_enabled": bool(tun.get("enable", False)) if isinstance(tun, Mapping) else False,
-        "dns_enabled": bool(dns.get("enable", False)) if isinstance(dns, Mapping) else False,
-        "required_targets_ok": True,
+        "rules_count": len(rules),
+        "tun_enabled": bool(tun.get("enable", False)),
+        "dns_enabled": bool(dns.get("enable", False)),
+        "structure_ok": True,
     }
 
 
@@ -564,6 +662,45 @@ def _package_field(status_text: str, package: str, field: str) -> str | None:
             match = re.search(rf"(?m)^{re.escape(field)}:\s*(\S+)", block)
             return match.group(1) if match else None
     return None
+
+
+def _package_arch_probe() -> str:
+    return (
+        "a=''; if [ -r /etc/openwrt_release ]; then . /etc/openwrt_release; a=${DISTRIB_ARCH:-}; fi; "
+        "if [ -z \"$a\" ] && command -v opkg >/dev/null 2>&1; then "
+        "a=$(opkg print-architecture 2>/dev/null | awk '$3>0 {a=$2} END {print a}'); fi; "
+        "if [ -z \"$a\" ] && command -v apk >/dev/null 2>&1; then "
+        "a=$(apk --print-arch 2>/dev/null | head -n 1); fi; "
+        "[ -n \"$a\" ] && printf 'package_arch=%s\\n' \"$a\"; "
+    )
+
+
+def _installed_package_status_command(package_names: tuple[str, ...]) -> str:
+    names = " ".join(shlex.quote(name) for name in package_names)
+    return (
+        "if command -v opkg >/dev/null 2>&1; then "
+        f"for p in {names}; do opkg status \"$p\" 2>/dev/null || true; done; "
+        "elif command -v apk >/dev/null 2>&1; then "
+        "a='unknown'; if [ -r /etc/openwrt_release ]; then . /etc/openwrt_release; a=${DISTRIB_ARCH:-unknown}; fi; "
+        f"for p in {names}; do "
+        "v=$(apk list --installed --manifest \"$p\" 2>/dev/null | awk -v p=\"$p\" '$1==p {print $2; exit}'); "
+        "[ -z \"$v\" ] || printf 'Package: %s\\nVersion: %s\\nArchitecture: %s\\n\\n' \"$p\" \"$v\" \"$a\"; done; fi"
+    )
+
+
+def _verify_installed_versions_command(manager: str, package_names: tuple[str, ...]) -> str:
+    names = " ".join(shlex.quote(name) for name in package_names)
+    if manager == "apk":
+        version_command = (
+            "apk list --installed --manifest \"$p\" 2>/dev/null | "
+            "awk -v p=\"$p\" '$1==p {print $2; exit}'"
+        )
+    else:
+        version_command = "opkg status \"$p\" 2>/dev/null | awk -F': ' '$1==\"Version\" {print $2; exit}'"
+    return (
+        f"set -eu; for p in {names}; do v=$({version_command}); "
+        "[ -n \"$v\" ] || exit 1; printf '%s=%s\\n' \"$p\" \"$v\"; done"
+    )
 
 
 def _semver(value: str | None) -> tuple[int, int, int] | None:
@@ -725,8 +862,9 @@ def _update_report(
         core_status = "unknown"
 
     update_statuses = {"package_update_available", "compatible_update_available"}
-    nikki_can_update = nikki_status in update_statuses and nikki_packages_ready and manager == "opkg"
-    core_can_update = core_status in update_statuses and core_package_ready and manager == "opkg"
+    supported_manager = manager in {"opkg", "apk"}
+    nikki_can_update = nikki_status in update_statuses and nikki_packages_ready and supported_manager
+    core_can_update = core_status in update_statuses and core_package_ready and supported_manager
     adopts_official_package = bool(
         core_can_update and mihomo_package_name not in {"mihomo-meta", "mihomo-alpha"}
     )
@@ -850,15 +988,13 @@ def preflight_router(
         )
         checks = dict(line.split("=", 1) for line in checks_raw.splitlines() if "=" in line)
         packages = session.run(
-            "(opkg status nikki 2>/dev/null; opkg status luci-app-nikki 2>/dev/null; "
-            "opkg status mihomo-meta 2>/dev/null; opkg status mihomo-alpha 2>/dev/null; opkg status mihomo 2>/dev/null; "
-            "apk info -a nikki 2>/dev/null; apk info -a luci-app-nikki 2>/dev/null; "
-            "apk info -a mihomo-meta 2>/dev/null; apk info -a mihomo-alpha 2>/dev/null; apk info -a mihomo 2>/dev/null) || true",
+            _installed_package_status_command(("nikki", "luci-app-nikki", "mihomo-meta", "mihomo-alpha", "mihomo")),
             label="версии Nikki и Mihomo",
             check=False,
         )
         package_updates_raw = session.run(
-            "if command -v opkg >/dev/null 2>&1; then "
+            _package_arch_probe()
+            + "if command -v opkg >/dev/null 2>&1; then "
             "echo package_manager=opkg; "
             "grep -RqsE '(OpenWrt-nikki|[[:space:]]nikki[[:space:]])' /etc/opkg 2>/dev/null && echo nikki_feed=1 || echo nikki_feed=0; "
             "opkg list-upgradable 2>/dev/null | awk '$1==\"nikki\" {print \"nikki_candidate=\"$5} "
@@ -911,7 +1047,7 @@ def preflight_router(
         mihomo_legacy_version = _package_version(packages, "mihomo")
         mihomo_package_name = "mihomo-meta" if mihomo_meta_version else "mihomo-alpha" if mihomo_alpha_version else None
         mihomo_package_version = mihomo_meta_version or mihomo_alpha_version or mihomo_legacy_version
-        package_arch = (
+        package_arch = package_state.get("package_arch") or (
             _package_field(packages, mihomo_package_name, "Architecture") if mihomo_package_name else None
         ) or _package_field(packages, "mihomo", "Architecture") or _package_field(packages, "nikki", "Architecture")
         free_kb = int(free_raw) if free_raw.isdigit() else 0
@@ -1096,84 +1232,6 @@ def delete_nikki_backup(
             raise SetupError("backup_delete_failed", "Роутер не подтвердил удаление резервной копии.")
         progress("backup_delete", "done", "Резервная копия удалена")
         return {"operation": "backup_delete", "backup_id": backup_id}
-    finally:
-        session.close()
-
-
-def install_adblock(
-    spec: ConnectionSpec,
-    expected_fingerprint: str,
-    *,
-    progress: ProgressCallback = _noop_progress,
-    session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
-) -> dict[str, Any]:
-    session = _connect_pinned(spec, expected_fingerprint, session_factory)
-    package_text = " ".join(ADBLOCK_PACKAGES)
-    try:
-        progress("adblock", "running", "Проверяем ресурсы и официальные пакеты AdBlock")
-        state = _simple_key_values(
-            session.run(
-                "mem=$(awk '/MemTotal/ {print $2}' /proc/meminfo); printf 'memory_kb=%s\\n' \"${mem:-0}\"; "
-                "if command -v opkg >/dev/null 2>&1; then echo opkg=1; echo apk=0; "
-                "elif command -v apk >/dev/null 2>&1; then echo opkg=0; echo apk=1; "
-                "else echo opkg=0; echo apk=0; fi",
-                label="проверка AdBlock",
-                check=False,
-            )
-        )
-        try:
-            memory_kb = int(state.get("memory_kb", "0"))
-        except ValueError:
-            memory_kb = 0
-        if memory_kb < ADBLOCK_MIN_RAM_KB:
-            raise SetupError(
-                "adblock_memory",
-                "AdBlock доступен только для роутеров класса 512 МБ оперативной памяти.",
-                {"required_mb": ADBLOCK_MIN_RAM_KB // 1024, "detected_mb": memory_kb // 1024},
-            )
-        if state.get("opkg") == "1":
-            session.run("opkg update", label="обновление списка пакетов AdBlock", timeout=120)
-            availability = session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "opkg list \"$p\" 2>/dev/null | awk -v p=\"$p\" '$1==p {found=1} END {print p \"=\" (found?1:0)}'; done",
-                label="проверка доступности пакетов AdBlock",
-                check=False,
-            )
-            dry_run_command = f"opkg install --noaction {package_text}; rc=$?; echo __KATO_ADBLOCK_DRYRUN__=$rc; exit $rc"
-            install_command = f"opkg install {package_text}"
-        elif state.get("apk") == "1":
-            session.run("apk update", label="обновление списка пакетов AdBlock", timeout=120)
-            availability = session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "apk search -x \"$p\" 2>/dev/null | grep -q . && echo \"$p=1\" || echo \"$p=0\"; done",
-                label="проверка доступности пакетов AdBlock",
-                check=False,
-            )
-            dry_run_command = f"apk add --simulate {package_text}; rc=$?; echo __KATO_ADBLOCK_DRYRUN__=$rc; exit $rc"
-            install_command = f"apk add {package_text}"
-        else:
-            raise SetupError("package_manager_missing", "Не найден поддерживаемый пакетный менеджер OpenWrt.")
-        available = _simple_key_values(availability)
-        if any(available.get(package) != "1" for package in ADBLOCK_PACKAGES):
-            raise SetupError("adblock_packages_unavailable", "Официальные пакеты AdBlock недоступны для этой прошивки.")
-        dry_run = session.run(dry_run_command, label="проверка установки AdBlock", timeout=120)
-        if "__KATO_ADBLOCK_DRYRUN__=0" not in dry_run:
-            raise SetupError("adblock_dry_run", "Пакетный менеджер не подтвердил безопасную установку AdBlock.")
-        progress("adblock", "running", "Устанавливаем AdBlock и русскую панель управления")
-        session.run(install_command, label="установка AdBlock", timeout=180)
-        verified = _simple_key_values(
-            session.run(
-                "for p in adblock luci-app-adblock luci-i18n-adblock-ru; do "
-                "if opkg status \"$p\" 2>/dev/null | grep -q '^Status: .* installed' || apk info -e \"$p\" >/dev/null 2>&1; "
-                "then echo \"$p=1\"; else echo \"$p=0\"; fi; done",
-                label="проверка AdBlock после установки",
-                check=False,
-            )
-        )
-        if any(verified.get(package) != "1" for package in ADBLOCK_PACKAGES):
-            raise SetupError("adblock_verification", "После установки не найдены все компоненты AdBlock.")
-        progress("adblock", "done", "AdBlock установлен")
-        return {"operation": "adblock_install", "packages": list(ADBLOCK_PACKAGES)}
     finally:
         session.close()
 
@@ -1631,6 +1689,7 @@ def _apply_command() -> str:
         f"uci set nikki.$sid.name={shlex.quote(PROFILE_NAME)}; "
         "uci set nikki.$sid.url=\"$(cat /tmp/kato-subscription-url)\"; "
         f"uci set nikki.$sid.user_agent={shlex.quote(USER_AGENT)}; "
+        "uci set nikki.$sid.kato_managed='1'; "
         "uci set nikki.$sid.prefer='remote'; "
         "uci set nikki.$sid.success='0'; "
         "uci set nikki.config.profile=\"subscription:$sid\"; "
@@ -1690,8 +1749,7 @@ def _update_router_components(
     release = board.get("release", {}) if isinstance(board, Mapping) else {}
     firmware_version = str(release.get("version", ""))
     packages_raw = session.run(
-        "(opkg status nikki 2>/dev/null; opkg status luci-app-nikki 2>/dev/null; "
-        "opkg status mihomo-meta 2>/dev/null; opkg status mihomo-alpha 2>/dev/null; opkg status mihomo 2>/dev/null) || true",
+        _installed_package_status_command(("nikki", "luci-app-nikki", "mihomo-meta", "mihomo-alpha", "mihomo")),
         label="пакеты обновления",
         check=False,
     )
@@ -1708,10 +1766,10 @@ def _update_router_components(
         label="пакетный менеджер обновления",
         check=False,
     ).strip()
-    if manager != "opkg":
+    if manager not in {"opkg", "apk"}:
         raise SetupError(
             "update_manager_unsupported",
-            "Автообновление компонентов сейчас поддерживается только для роутеров с opkg.",
+            "На роутере не найден поддерживаемый пакетный менеджер OpenWrt.",
         )
 
     feed = package_fetcher(firmware_version, package_arch)
@@ -1760,28 +1818,38 @@ def _update_router_components(
             selected.append((name, version, architecture))
 
     package_root = feed_url[: -len("/index.json")]
-    download_parts = ["set -eu", "rm -f /tmp/kato-update-*.ipk"]
     install_files: list[str] = []
-    for index, (name, version, architecture) in enumerate(selected):
-        filename = f"{name}_{version}_{architecture}.ipk"
-        if not re.fullmatch(r"[A-Za-z0-9._+~-]{1,220}", filename):
-            raise SetupError("unsafe_update_package", "Имя пакета обновления отклонено проверкой безопасности.")
-        local_path = f"/tmp/kato-update-{index}.ipk"
-        download_parts.append(f"wget -q -O {shlex.quote(local_path)} {shlex.quote(package_root + '/' + filename)}")
-        download_parts.append(f"test -s {shlex.quote(local_path)}")
-        install_files.append(local_path)
-    session.run("; ".join(download_parts), label="загрузка обновлений", timeout=180)
+    if manager == "opkg":
+        download_parts = ["set -eu", "rm -f /tmp/kato-update-*.ipk"]
+        for index, (name, version, architecture) in enumerate(selected):
+            filename = f"{name}_{version}_{architecture}.ipk"
+            if not re.fullmatch(r"[A-Za-z0-9._+~-]{1,220}", filename):
+                raise SetupError("unsafe_update_package", "Имя пакета обновления отклонено проверкой безопасности.")
+            local_path = f"/tmp/kato-update-{index}.ipk"
+            download_parts.append(f"wget -q -O {shlex.quote(local_path)} {shlex.quote(package_root + '/' + filename)}")
+            download_parts.append(f"test -s {shlex.quote(local_path)}")
+            install_files.append(local_path)
+        session.run("; ".join(download_parts), label="загрузка обновлений", timeout=180)
+        dry_run_command = "opkg --noaction install " + " ".join(shlex.quote(path) for path in install_files)
+    else:
+        repository_url = package_root + "/packages.adb"
+        selected_names = " ".join(shlex.quote(name) for name, _version, _architecture in selected)
+        session.run("apk update", label="загрузка обновлений", timeout=180)
+        dry_run_command = (
+            "apk add --simulate --allow-untrusted --no-cache -X "
+            + shlex.quote(repository_url)
+            + " "
+            + selected_names
+        )
 
     dry_run_raw = session.run(
-        "set +e; output=$(opkg --noaction install "
-        + " ".join(shlex.quote(path) for path in install_files)
-        + " 2>&1); code=$?; printf '%s\\n' \"$output\"; "
-        "printf '__KATO_OPKG_EXIT__=%s\\n' \"$code\"; exit 0",
+        "set +e; output=$(" + dry_run_command + " 2>&1); code=$?; printf '%s\\n' \"$output\"; "
+        "printf '__KATO_PACKAGE_EXIT__=%s\\n' \"$code\"; exit 0",
         label="проверка установки обновлений",
         timeout=180,
         check=False,
     )
-    dry_run_match = re.search(r"^__KATO_OPKG_EXIT__=(\d+)$", dry_run_raw, re.MULTILINE)
+    dry_run_match = re.search(r"^__KATO_(?:PACKAGE|OPKG)_EXIT__=(\d+)$", dry_run_raw, re.MULTILINE)
     if not dry_run_match or int(dry_run_match.group(1)) != 0:
         session.run(
             "rm -f /tmp/kato-update-*.ipk",
@@ -1791,6 +1859,7 @@ def _update_router_components(
         details: dict[str, Any] = {
             "stage": "package_dry_run",
             "package_install_started": False,
+            "package_diagnostic": package_manager_failure_diagnostic(dry_run_raw, manager),
         }
         space_match = re.search(
             r"Only have\s+(\d+)kb.+?needs\s+(\d+)",
@@ -1812,7 +1881,7 @@ def _update_router_components(
             )
         raise SetupError(
             "component_update_precheck_failed",
-            "opkg отклонил выбранные пакеты до установки. Nikki не останавливался, пакеты не изменены.",
+            "Пакетный менеджер отклонил выбранные пакеты до установки. Nikki не останавливался, пакеты не изменены.",
             details,
         )
 
@@ -1822,28 +1891,27 @@ def _update_router_components(
         label="остановка Nikki",
         timeout=75,
     )
-    package_paths = {
-        name: install_files[index]
-        for index, (name, _version, _architecture) in enumerate(selected)
-    }
+    package_paths = {name: install_files[index] for index, (name, _version, _architecture) in enumerate(selected)} if manager == "opkg" else {}
+    repository_url = package_root + "/packages.adb"
     if update_mihomo:
-        session.run(
-            "opkg install " + shlex.quote(package_paths[mihomo_package]),
-            label="установка Mihomo Core",
-            timeout=300,
+        command = (
+            "opkg install " + shlex.quote(package_paths[mihomo_package])
+            if manager == "opkg"
+            else "apk add --allow-untrusted --no-cache -X " + shlex.quote(repository_url) + " " + shlex.quote(mihomo_package)
         )
+        session.run(command, label="установка Mihomo Core", timeout=300)
     if update_nikki:
-        session.run(
-            "opkg install "
-            + " ".join(shlex.quote(package_paths[name]) for name in ("nikki", "luci-app-nikki")),
-            label="установка Nikki",
-            timeout=300,
+        command = (
+            "opkg install " + " ".join(shlex.quote(package_paths[name]) for name in ("nikki", "luci-app-nikki"))
+            if manager == "opkg"
+            else "apk add --allow-untrusted --no-cache -X "
+            + shlex.quote(repository_url)
+            + " nikki luci-app-nikki"
         )
-    verify_names = " ".join(shlex.quote(name) for name, _version, _arch in selected)
+        session.run(command, label="установка Nikki", timeout=300)
+    verify_package_names = tuple(name for name, _version, _arch in selected)
     verified_raw = session.run(
-        "set -eu; for p in " + verify_names + "; do "
-        "v=$(opkg status \"$p\" 2>/dev/null | awk -F': ' '$1==\"Version\" {print $2; exit}'); "
-        "[ -n \"$v\" ] || exit 1; printf '%s=%s\\n' \"$p\" \"$v\"; done",
+        _verify_installed_versions_command(manager, verify_package_names),
         label="проверка обновления компонентов",
         timeout=45,
     )
@@ -1971,6 +2039,262 @@ def update_router_components(
         session.close()
 
 
+def install_router_vpn(
+    spec: ConnectionSpec,
+    expected_fingerprint: str,
+    *,
+    progress: ProgressCallback = _noop_progress,
+    session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
+    subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
+    package_fetcher: Callable[[str, str | None], dict[str, Any]] = fetch_latest_nikki_packages,
+    template_text: str | None = None,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Install the exact official Nikki/Mihomo package set, then configure KatoVPN."""
+    progress("validate", "running", "Проверяем подписку и профиль до установки")
+    subscription_fetcher(spec.subscription_url)
+    if template_text is None:
+        template_text = profile_template_path().read_text(encoding="utf-8")
+    validate_portable_template(template_text)
+    progress("validate", "done", "Подписка и профиль готовы")
+
+    session = session_factory(spec)
+    package_install_started = False
+    verified_versions: dict[str, str] = {}
+    try:
+        progress("connect", "running", "Повторно проверяем роутер перед установкой")
+        session.connect()
+        if not expected_fingerprint or not secrets.compare_digest(session.fingerprint, str(expected_fingerprint)):
+            raise SetupError("host_key_changed", "SSH-ключ роутера изменился после проверки. Установка остановлена.")
+
+        board_raw = session.run("ubus call system board", label="сведения для установки VPN")
+        try:
+            board = json.loads(board_raw)
+        except json.JSONDecodeError as exc:
+            raise SetupError("install_board_info", "Не удалось повторно определить версию OpenWrt.") from exc
+        release = board.get("release", {}) if isinstance(board, Mapping) else {}
+        firmware_version = str(release.get("version", ""))
+        distribution = str(release.get("distribution") or release.get("description") or "").lower()
+
+        readiness_raw = session.run(
+            "mem=$(awk '/MemTotal/ {print $2}' /proc/meminfo); "
+            "free=$(df -Pk /overlay 2>/dev/null | awk 'NR==2 {print $4}'); "
+            "for c in uci fw4 nft opkg apk; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c=1\" || echo \"$c=0\"; done; "
+            + _package_arch_probe()
+            + "printf 'memory_kb=%s\\noverlay_free_kb=%s\\n' \"${mem:-0}\" \"${free:-0}\"; "
+            "[ -w /overlay ] && echo overlay_writable=1 || echo overlay_writable=0; "
+            "nslookup openwrt.org >/dev/null 2>&1 && echo dns=1 || echo dns=0; "
+            "if command -v uclient-fetch >/dev/null 2>&1; then fetch='uclient-fetch -q -T 15 -O -'; "
+            "elif command -v wget >/dev/null 2>&1; then fetch='wget -q -T 15 -O -'; "
+            "elif command -v curl >/dev/null 2>&1; then fetch='curl -fsSL --max-time 15'; else fetch=''; fi; "
+            "[ -n \"$fetch\" ] && $fetch https://openwrt.org/ >/dev/null 2>&1 && echo https=1 || echo https=0; "
+            "[ -n \"$fetch\" ] && $fetch https://nikkinikki.pages.dev/ >/dev/null 2>&1 && echo feed=1 || echo feed=0",
+            label="готовность установки VPN",
+            timeout=55,
+            check=False,
+        )
+        readiness = _simple_key_values(readiness_raw)
+
+        def number(key: str) -> int:
+            try:
+                return max(0, int(readiness.get(key, "0")))
+            except ValueError:
+                return 0
+
+        blockers: list[str] = []
+        if not any(name in distribution for name in ("openwrt", "immortalwrt")) or _parse_version_pair(firmware_version) < (24, 10):
+            blockers.append("Нужен OpenWrt/ImmortalWrt 24.10 или новее.")
+        package_manager = "opkg" if readiness.get("opkg") == "1" else "apk" if readiness.get("apk") == "1" else "unknown"
+        if any(readiness.get(name) != "1" for name in ("uci", "fw4", "nft")) or package_manager == "unknown":
+            blockers.append("Не найдены пакетный менеджер OpenWrt, UCI или firewall4/nftables.")
+        if number("memory_kb") < VPN_INSTALL_MIN_RAM_KB:
+            blockers.append("Для VPN-модуля нужно не менее 200 МБ доступной оперативной памяти.")
+        if number("overlay_free_kb") < VPN_INSTALL_MIN_OVERLAY_KB:
+            blockers.append("Для установки нужно не менее 64 МБ свободного места на overlay.")
+        if readiness.get("overlay_writable") != "1":
+            blockers.append("Системный раздел роутера доступен только для чтения.")
+        if readiness.get("dns") != "1" or readiness.get("https") != "1" or readiness.get("feed") != "1":
+            blockers.append("Роутер не может скачать официальный VPN-модуль по HTTPS.")
+        package_arch = readiness.get("package_arch", "")
+        if not re.fullmatch(r"[A-Za-z0-9_+.-]{1,80}", package_arch):
+            blockers.append("Не удалось определить архитектуру пакетов роутера.")
+        if blockers:
+            raise SetupError("vpn_install_incompatible", "Установка VPN-модуля недоступна.", {"blockers": blockers})
+        progress("connect", "done", "Роутер повторно проверен")
+
+        feed = package_fetcher(firmware_version, package_arch)
+        feed_url = str(feed.get("url") or "")
+        parsed_feed = urllib.parse.urlsplit(feed_url)
+        versions = feed.get("packages", {})
+        if (
+            feed.get("status") != "available"
+            or parsed_feed.scheme.lower() != "https"
+            or parsed_feed.hostname != "nikkinikki.pages.dev"
+            or not parsed_feed.path.endswith("/index.json")
+            or not isinstance(versions, Mapping)
+            or not {"nikki", "luci-app-nikki", "mihomo-meta"}.issubset(versions)
+        ):
+            raise SetupError("vpn_install_source_unavailable", "Официальный совместимый комплект VPN-модуля сейчас недоступен.")
+
+        selected = (
+            ("mihomo-meta", str(versions["mihomo-meta"]), package_arch),
+            ("nikki", str(versions["nikki"]), package_arch),
+            ("luci-app-nikki", str(versions["luci-app-nikki"]), "all"),
+        )
+        package_root = feed_url[: -len("/index.json")]
+        install_files: list[str] = []
+        for name, version, _architecture in selected:
+            if not re.fullmatch(r"[A-Za-z0-9._+~:-]{1,100}", version):
+                raise SetupError("vpn_install_package_invalid", "Официальный индекс вернул некорректную версию пакета.")
+
+        progress("packages", "running", "Обновляем список и проверяем официальный комплект")
+        if package_manager == "opkg":
+            download_parts = ["set -eu", "rm -f /tmp/kato-install-*.ipk"]
+            for index, (name, version, architecture) in enumerate(selected):
+                filename = f"{name}_{version}_{architecture}.ipk"
+                if not re.fullmatch(r"[A-Za-z0-9._+~-]{1,220}", filename):
+                    raise SetupError("vpn_install_package_invalid", "Имя пакета отклонено проверкой безопасности.")
+                local_path = f"/tmp/kato-install-{index}.ipk"
+                package_url = package_root + "/" + filename
+                download_parts.append(
+                    "if command -v uclient-fetch >/dev/null 2>&1; then "
+                    f"uclient-fetch -q -T 90 -O {shlex.quote(local_path)} {shlex.quote(package_url)}; "
+                    "elif command -v wget >/dev/null 2>&1; then "
+                    f"wget -q -T 90 -O {shlex.quote(local_path)} {shlex.quote(package_url)}; "
+                    "elif command -v curl >/dev/null 2>&1; then "
+                    f"curl -fsSL --connect-timeout 10 --max-time 90 -o {shlex.quote(local_path)} {shlex.quote(package_url)}; "
+                    "else exit 127; fi"
+                )
+                download_parts.append(f"test -s {shlex.quote(local_path)}")
+                install_files.append(local_path)
+            session.run("opkg update", label="обновление списка пакетов VPN", timeout=180)
+            session.run("; ".join(download_parts), label="загрузка VPN-модуля", timeout=300)
+            install_arguments = " ".join(
+                [*(shlex.quote(name) for name in VPN_INSTALL_DEPENDENCIES), *(shlex.quote(path) for path in install_files)]
+            )
+            dry_run_command = "opkg --noaction install " + install_arguments
+            install_command = "opkg install " + install_arguments
+        else:
+            repository_url = package_root + "/packages.adb"
+            install_arguments = "mihomo-meta nikki luci-app-nikki"
+            session.run("apk update", label="обновление списка пакетов VPN", timeout=180)
+            dry_run_command = (
+                "apk add --simulate --allow-untrusted --no-cache -X "
+                + shlex.quote(repository_url)
+                + " "
+                + install_arguments
+            )
+            install_command = (
+                "apk add --allow-untrusted --no-cache -X "
+                + shlex.quote(repository_url)
+                + " "
+                + install_arguments
+            )
+        dry_run_raw = session.run(
+            "set +e; output=$(" + dry_run_command + " 2>&1); code=$?; "
+            "printf '%s\\n' \"$output\"; printf '__KATO_PACKAGE_EXIT__=%s\\n' \"$code\"; exit 0",
+            label="проверка установки VPN",
+            timeout=300,
+            check=False,
+        )
+        dry_run_match = re.search(r"^__KATO_(?:PACKAGE|OPKG)_EXIT__=(\d+)$", dry_run_raw, re.MULTILINE)
+        if not dry_run_match or int(dry_run_match.group(1)) != 0:
+            details: dict[str, Any] = {
+                "stage": "package_dry_run",
+                "package_install_started": False,
+                "package_diagnostic": package_manager_failure_diagnostic(dry_run_raw, package_manager),
+            }
+            space_match = re.search(r"Only have\s+(\d+)kb.+?needs\s+(\d+)", dry_run_raw, re.IGNORECASE | re.DOTALL)
+            if space_match:
+                details.update({"available_overlay_kb": int(space_match.group(1)), "required_overlay_kb": int(space_match.group(2))})
+            if space_match or re.search(r"not enough space|no space left", dry_run_raw, re.IGNORECASE):
+                raise SetupError("vpn_install_insufficient_space", "На роутере недостаточно места. Пакеты не изменены.", details)
+            raise SetupError("vpn_install_precheck_failed", "Пакетный менеджер отклонил комплект до установки. Пакеты не изменены.", details)
+
+        package_install_started = True
+        session.run(install_command, label="установка VPN-модуля", timeout=600)
+        verify_package_names = tuple(name for name, _version, _arch in selected)
+        verified_raw = session.run(
+            _verify_installed_versions_command(package_manager, verify_package_names),
+            label="проверка пакетов VPN",
+            timeout=60,
+        )
+        verified_versions = _simple_key_values(verified_raw)
+        for name, expected, _architecture in selected:
+            if verified_versions.get(name) != expected:
+                raise SetupError(
+                    "vpn_install_verification",
+                    f"Пакет {name} не подтвердил ожидаемую версию {expected}.",
+                    {"package_install_started": True, "packages_installed": True},
+                )
+        files_ready = session.run(
+            "[ -x /etc/init.d/nikki ] && [ -s /etc/config/nikki ] && "
+            "(command -v mihomo >/dev/null 2>&1 || [ -x /usr/libexec/mihomo ] || [ -x /usr/bin/mihomo ]) "
+            "&& echo ready || echo missing",
+            label="проверка файлов VPN",
+            check=False,
+        )
+        if files_ready.strip() != "ready":
+            raise SetupError(
+                "vpn_install_runtime_missing",
+                "Пакеты установлены, но файлы Nikki/Mihomo не прошли проверку.",
+                {"package_install_started": True, "packages_installed": True},
+            )
+        progress("packages", "done", "VPN-модуль установлен и проверен")
+    except SetupError as exc:
+        if package_install_started:
+            exc.details.setdefault("package_install_started", True)
+            exc.details.setdefault("packages_installed", bool(verified_versions))
+        raise
+    except Exception as exc:
+        raise SetupError(
+            "unexpected_vpn_install",
+            "Установка VPN-модуля остановлена из-за непредвиденной ошибки.",
+            {"package_install_started": package_install_started},
+        ) from exc
+    finally:
+        try:
+            session.run("rm -f /tmp/kato-install-*.ipk", label="очистка установки VPN", check=False)
+        except Exception:
+            pass
+        session.close()
+
+    try:
+        configured = configure_router(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            package_fetcher=package_fetcher,
+            template_text=template_text,
+            verify_setup=verify_setup,
+        )
+    except SetupError as exc:
+        exc.details.setdefault("packages_installed", True)
+        exc.details.setdefault("installed_versions", dict(verified_versions))
+        raise
+    return {
+        **configured,
+        "operation": "install",
+        "packages_installed": True,
+        "installed_versions": dict(verified_versions),
+    }
+
+
+def _validate_mihomo_runtime(session: RemoteSession) -> None:
+    result = session.run(
+        "bin=$(command -v mihomo 2>/dev/null || true); "
+        "if [ -z \"$bin\" ]; then for candidate in /usr/libexec/mihomo /usr/bin/mihomo; do "
+        "if [ -x \"$candidate\" ]; then bin=$candidate; break; fi; done; fi; "
+        "if [ -z \"$bin\" ]; then echo unavailable; "
+        "elif \"$bin\" -t -f /etc/nikki/run/config.yaml >/dev/null 2>&1; then echo valid; else echo invalid; fi",
+        label="проверка конфигурации Mihomo", timeout=90, check=False,
+    ).strip()
+    if result != "valid":
+        raise SetupError("mihomo_runtime_validation", "Mihomo не подтвердил конфигурацию.")
+
+
 def replace_router_subscription(
     spec: ConnectionSpec,
     expected_fingerprint: str,
@@ -1978,6 +2302,7 @@ def replace_router_subscription(
     progress: ProgressCallback = _noop_progress,
     session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
     subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Replace the URL of the active Nikki subscription without touching packages."""
     progress("validate", "running", "Проверяем новую ссылку подписки")
@@ -2083,10 +2408,13 @@ def replace_router_subscription(
                 "profile_verification",
                 "После смены ссылки Nikki выбрал другой профиль.",
             )
+        if verify_setup:
+            _validate_mihomo_runtime(session)
         progress("subscription", "done", "Ссылка подписки обновлена и проверена")
         return {
             "status": "success",
             "operation": "subscription",
+            **({"setup": verify_setup(session)} if verify_setup else {}),
             "subscription_id": sid,
             "backup_path": backup_dir,
             "components_changed": False,
@@ -2142,6 +2470,7 @@ def configure_router(
     template_text: str | None = None,
     update_nikki: bool = False,
     update_mihomo: bool = False,
+    verify_setup: Callable[[RemoteSession], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     progress("validate", "running", "Повторно проверяем профиль перед изменением")
     subscription_fetcher(spec.subscription_url)
@@ -2214,6 +2543,7 @@ def configure_router(
         profile_info = validate_subscription_document(profile_raw)
         runtime_raw = session.read_file("/etc/nikki/run/config.yaml")
         runtime_info = validate_subscription_document(runtime_raw)
+        _validate_mihomo_runtime(session)
 
         nft = session.run("nft list table inet nikki 2>/dev/null", label="таблица nftables", timeout=20)
         if "chain lan_redirect" not in nft or "chain lan_tproxy" not in nft:
@@ -2221,7 +2551,16 @@ def configure_router(
         policy = session.run("ip -4 rule show", label="policy routing", check=False)
         if "fwmark 0x80/0xff lookup 80" not in policy:
             raise SetupError("routing_verification", "Не найдено policy-routing правило TPROXY 0x80/0xff.")
-        dns = session.run("ss -H -lnup 2>/dev/null | grep -E '(:|\\])1053[[:space:]]' || true", label="DNS listener", check=False)
+        dns = session.run(
+            "if command -v ss >/dev/null 2>&1 && "
+            "ss -H -lnup 2>/dev/null | grep -Eq '(:|\\])1053([[:space:]]|$)'; then echo listening; "
+            "elif command -v netstat >/dev/null 2>&1 && "
+            "netstat -lnu 2>/dev/null | grep -Eq '(:|\\])1053[[:space:]]'; then echo listening; "
+            "elif awk '$2 ~ /:041D$/ { found=1 } END { exit !found }' /proc/net/udp /proc/net/udp6 2>/dev/null; "
+            "then echo listening; fi",
+            label="DNS listener",
+            check=False,
+        )
         if not dns:
             raise SetupError("dns_verification", "Mihomo не слушает DNS-порт 1053.")
 
@@ -2238,6 +2577,7 @@ def configure_router(
         return {
             "status": "success",
             "profile_name": PROFILE_NAME,
+            **({"setup": verify_setup(session)} if verify_setup else {}),
             "user_agent": USER_AGENT,
             "backup_path": backup_dir,
             "active_profile": active,
@@ -2288,6 +2628,117 @@ def configure_router(
             except Exception:
                 pass
             session.close()
+
+
+def setup_router_vpn(
+    spec: ConnectionSpec,
+    expected_fingerprint: str,
+    *,
+    progress: ProgressCallback = _noop_progress,
+    session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
+    subscription_fetcher: Callable[[str], dict[str, Any]] = fetch_and_validate_subscription,
+    package_fetcher: Callable[[str, str | None], dict[str, Any]] = fetch_latest_nikki_packages,
+) -> dict[str, Any]:
+    """Choose the safe setup path from a fresh, pinned assessment."""
+    from .setup import inspect_router_setup
+
+    def inspect_fresh() -> dict[str, Any]:
+        session = session_factory(spec)
+        try:
+            session.connect()
+            if not expected_fingerprint or not secrets.compare_digest(
+                session.fingerprint, str(expected_fingerprint)
+            ):
+                raise SetupError(
+                    "host_key_changed",
+                    "SSH-ключ роутера изменился после проверки. Настройка остановлена.",
+                )
+            return inspect_router_setup(session)
+        finally:
+            session.close()
+
+    progress("inspect", "running", "Повторно проверяем состояние настройки")
+    assessment = inspect_fresh()
+    action = str(assessment.get("action", "blocked"))
+    if assessment.get("state") == "unknown" or action == "blocked":
+        progress("inspect", "error", "Состояние настройки не удалось подтвердить")
+        raise SetupError(
+            "setup_assessment_unknown",
+            "Не удалось безопасно определить состояние настройки KatoVPN.",
+            {"assessment": assessment},
+        )
+    progress("inspect", "done", "Состояние настройки подтверждено")
+
+    def verify_setup(session: RemoteSession) -> dict[str, Any]:
+        # Execute inside the underlying operation's rollback boundary.
+        progress("verify", "running", "Подтверждаем итоговое состояние настройки")
+        try:
+            final = inspect_router_setup(session)
+        except Exception as exc:
+            raise SetupError("setup_verification_failed", "Не удалось подтвердить итоговое состояние KatoVPN.") from exc
+        if final.get("state") != "ready":
+            raise SetupError(
+                "setup_verification_failed", "Итоговое состояние KatoVPN не подтвердилось.",
+                {"setup_action": action, "assessment": final},
+            )
+        progress("verify", "done", "Настройка KatoVPN подтверждена")
+        return final
+
+    if action == "install":
+        operation_result = install_router_vpn(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            package_fetcher=package_fetcher,
+            verify_setup=verify_setup,
+        )
+    elif action == "configure":
+        operation_result = configure_router(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            package_fetcher=package_fetcher,
+            update_nikki=False,
+            update_mihomo=False,
+            verify_setup=verify_setup,
+        )
+    elif action == "refresh":
+        operation_result = replace_router_subscription(
+            spec,
+            expected_fingerprint,
+            progress=progress,
+            session_factory=session_factory,
+            subscription_fetcher=subscription_fetcher,
+            verify_setup=verify_setup,
+        )
+    else:
+        raise SetupError(
+            "setup_action_invalid",
+            "Автоматическая настройка остановлена из-за неизвестного действия.",
+        )
+
+    final_assessment = operation_result["setup"]
+
+    warnings_by_code: dict[str, dict[str, Any]] = {}
+    for item in [*assessment.get("warnings", []), *final_assessment.get("warnings", [])]:
+        if isinstance(item, Mapping) and isinstance(item.get("code"), str):
+            warnings_by_code[item["code"]] = dict(item)
+    return {
+        **operation_result,
+        "operation": "setup",
+        "setup_action": action,
+        "setup": final_assessment,
+        "warnings": list(warnings_by_code.values()),
+        "verification": {
+            "configuration": "verified",
+            "runtime": "verified",
+            "lan_connectivity": "not_tested",
+        },
+    }
 
 
 def restore_router_backup(

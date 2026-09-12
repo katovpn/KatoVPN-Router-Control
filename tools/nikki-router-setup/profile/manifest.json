@@ -1,6 +1,6 @@
 {
-  "schema": "katovpn.nikki_router_profile.v1",
-  "profile_name": "KatoVPN - Router Russia",
+  "schema": "katovpn.nikki_router_profile.v2",
+  "profile_name": "KatoVPN Router",
   "source_capture_date": "2026-08-03",
   "source_platform": {
     "firmware": "ImmortalWrt 24.10-SNAPSHOT",
@@ -19,12 +19,8 @@
   },
   "subscription": {
     "included": false,
-    "user_agent": "mihomo KatoVPN-Router/1.0",
-    "required_policy_targets": [
-      "DIRECT",
-      "⚡️ Авто",
-      "🇳🇱 Нидерланды"
-    ]
+    "user_agent": "katorouter-ru",
+    "policy_source": "subscription"
   },
   "secrets_included": false,
   "runtime_cache_included": false,
