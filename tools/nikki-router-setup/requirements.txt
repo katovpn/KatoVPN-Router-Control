@@ -1,4 +1,4 @@
-paramiko==5.0.0
+paramiko==5.1.0
 PyYAML==6.0.3
 requests==2.34.2
 pyinstaller==6.21.0
