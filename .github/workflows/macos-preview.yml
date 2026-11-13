@@ -1,0 +1,52 @@
+name: macOS preview
+
+on:
+  push:
+    branches: [codex/macos-router-control]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/nikki-router-setup/requirements.txt
+      - name: Verify public source
+        shell: pwsh
+        run: ./tools/public-source-check.ps1
+      - name: Install pinned dependencies and test
+        run: |
+          python -m pip install -r tools/nikki-router-setup/requirements.txt
+          python -m unittest discover -s tools/tests -p 'test_*router*.py'
+      - name: Package and smoke-test
+        run: bash tools/nikki-router-setup/build-macos.sh "$TARGET_ARCH" "$RUNNER_TEMP/kato-macos"
+      - name: Generate SBOM
+        run: |
+          python -m pip install cyclonedx-bom==7.3.1
+          cyclonedx-py requirements tools/nikki-router-setup/requirements.txt --output-format JSON --output-file "$RUNNER_TEMP/kato-macos/Router-Control-macos-$TARGET_ARCH.cdx.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Router-Control-macos-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/kato-macos/*.zip
+            ${{ runner.temp }}/kato-macos/*.sha256
+            ${{ runner.temp }}/kato-macos/*.cdx.json
+          if-no-files-found: error
