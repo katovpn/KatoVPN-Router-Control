@@ -34,6 +34,10 @@ jobs:
         run: ./tools/public-source-check.ps1
       - name: Install pinned dependencies and test
         run: |
+          if [[ "$TARGET_ARCH" == x86_64 ]]; then
+            OPENSSL_STATIC=1 OPENSSL_DIR="$(brew --prefix openssl@3)" \
+              python -m pip install --no-cache-dir --no-binary cryptography 'cryptography==50.0.2'
+          fi
           python -m pip install -r tools/nikki-router-setup/requirements.txt
           python -m unittest discover -s tools/tests -p 'test_*router*.py'
       - name: Package and smoke-test
