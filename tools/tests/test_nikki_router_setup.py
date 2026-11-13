@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -980,15 +981,26 @@ class NikkiRouterSetupTests(unittest.TestCase):
             lifecycle_poll_seconds=0.005,
         )
         state.server = FakeServer()
-        state.start_lifecycle_monitor()
-        state.client_connected("old-page")
-        state.client_disconnected("old-page")
-        time.sleep(0.03)
-        state.client_connected("reloaded-page")
-        time.sleep(0.09)
+        now = 0.0
+        steps = iter((0.03, 0.12, 0.22))
 
-        self.assertFalse(shutdown_called.is_set(), "normal page reload stopped the executable")
-        state.client_disconnected("reloaded-page")
+        def advance(_delay: float) -> None:
+            nonlocal now
+            now = next(steps)
+            if now == 0.03:
+                state.client_connected("reloaded-page")
+            elif now == 0.12:
+                self.assertFalse(state.is_shutdown_requested(), "normal page reload stopped the app")
+                state.client_disconnected("reloaded-page")
+
+        with patch.object(server_module, "time") as clock:
+            clock.monotonic.side_effect = lambda: now
+            clock.sleep.side_effect = advance
+            state.client_connected("old-page")
+            state.client_disconnected("old-page")
+            state._lifecycle_loop()
+
+        self.assertEqual(now, 0.22)
         self.assertTrue(shutdown_called.wait(0.5))
 
     def test_lifecycle_waits_for_router_job_before_stopping(self) -> None:
