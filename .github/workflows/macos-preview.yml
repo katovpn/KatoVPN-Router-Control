@@ -46,7 +46,7 @@ jobs:
         with:
           name: Router-Control-macos-${{ matrix.arch }}
           path: |
-            ${{ runner.temp }}/kato-macos/*.zip
+            ${{ runner.temp }}/kato-macos/*.dmg
             ${{ runner.temp }}/kato-macos/*.sha256
             ${{ runner.temp }}/kato-macos/*.cdx.json
           if-no-files-found: error
