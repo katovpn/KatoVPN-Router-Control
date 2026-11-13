@@ -20,13 +20,18 @@ exe="$bundle/Contents/MacOS/$app"
 [[ "$(lipo -archs "$exe")" == "$arch" ]]
 codesign --verify --deep --strict "$bundle"
 "$exe" --smoke-test --no-browser
-file="KatoVPN-Router-Control-v0.4.3-preview-macos-$arch.zip"
-ditto -c -k --keepParent "$bundle" "$out/$file"
 cd "$out"
-shasum -a 256 "$file" > "$file.sha256"
-shasum -a 256 -c "$file.sha256"
 dmg="KatoVPN-Router-Control-v0.4.3-preview-macos-$arch.dmg"
-hdiutil create -srcfolder "$bundle" -volname "$app" -format UDZO "$out/$dmg"
+mkdir "$scratch/image" "$scratch/mount"
+ditto "$bundle" "$scratch/image/$app.app"
+hdiutil create -srcfolder "$scratch/image" -volname "$app" -format UDZO "$out/$dmg"
 hdiutil verify "$out/$dmg"
+hdiutil attach -readonly -nobrowse -mountpoint "$scratch/mount" "$out/$dmg"
+trap 'hdiutil detach "$scratch/mount"' EXIT
+mounted="$scratch/mount/$app.app"
+codesign --verify --deep --strict "$mounted"
+"$mounted/Contents/MacOS/$app" --smoke-test --no-browser
+hdiutil detach "$scratch/mount"
+trap - EXIT
 shasum -a 256 "$dmg" > "$dmg.sha256"
 shasum -a 256 -c "$dmg.sha256"
