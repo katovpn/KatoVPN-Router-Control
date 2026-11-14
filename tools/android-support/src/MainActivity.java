@@ -16,16 +16,23 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private EditText host, port, user, password;
-    private Button start, stop, copy;
+    private Button start, startAccess, stop, copy, share;
+    private LinearLayout credentials;
     private TextView state;
     private AlertDialog confirmation;
     private final Runnable update = new Runnable() {
         public void run() {
             boolean busy = SupportService.busy;
+            credentials.setVisibility(SupportService.signedIn ? android.view.View.GONE : android.view.View.VISIBLE);
             start.setEnabled(!busy);
+            startAccess.setVisibility(SupportService.signedIn && !SupportService.opening ? android.view.View.VISIBLE : android.view.View.GONE);
             stop.setEnabled(busy && !SupportService.stopping);
+            stop.setVisibility(busy ? android.view.View.VISIBLE : android.view.View.GONE);
+            stop.setText(SupportService.opening ? "Завершить доступ" : "Отменить подключение");
             String details = SupportService.details;
             copy.setEnabled(!details.isEmpty());
+            copy.setVisibility(details.isEmpty() ? android.view.View.GONE : android.view.View.VISIBLE);
+            share.setVisibility(copy.getVisibility());
             String message = SupportService.status;
             long deadline = SupportService.deadline;
             if (!details.isEmpty() && deadline > 0) {
@@ -38,10 +45,10 @@ public final class MainActivity extends Activity {
                 confirmation.dismiss();
                 confirmation = null;
             } else if (fingerprint != null && confirmation == null) {
-                confirmation = new AlertDialog.Builder(MainActivity.this).setTitle("SSH-ключ роутера")
-                    .setMessage("Сверьте отпечаток с вашим роутером.\n\n" + fingerprint)
+                confirmation = new AlertDialog.Builder(MainActivity.this).setTitle("Первый вход на роутер")
+                    .setMessage("Сверьте SSH-отпечаток роутера. После успешного входа приложение его запомнит.\n\n" + fingerprint)
                     .setNegativeButton("Отмена", (d, w) -> SupportService.reply(false))
-                    .setPositiveButton("Подтвердить", (d, w) -> SupportService.reply(true))
+                    .setPositiveButton("Продолжить вход", (d, w) -> SupportService.reply(true))
                     .setOnCancelListener(d -> SupportService.reply(false)).show();
             }
             handler.postDelayed(this, 250);
@@ -67,16 +74,25 @@ public final class MainActivity extends Activity {
         intro.setText("Подключитесь к Wi-Fi роутера. Поддержка получит доступ к SSH на срок до одного часа.");
         intro.setPadding(0, padding / 2, 0, padding / 2);
         form.addView(intro);
-        host = field(form, "IP роутера", "", InputType.TYPE_CLASS_PHONE);
-        port = field(form, "SSH-порт", "22", InputType.TYPE_CLASS_NUMBER);
-        user = field(form, "Логин", "root", InputType.TYPE_CLASS_TEXT);
-        password = field(form, "Пароль SSH", "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        state = new TextView(this);
+        state.setTextSize(16);
+        state.setTextIsSelectable(true);
+        state.setPadding(0, padding / 2, 0, padding / 2);
+        form.addView(state);
+        credentials = new LinearLayout(this);
+        credentials.setOrientation(LinearLayout.VERTICAL);
+        form.addView(credentials);
+        host = field(credentials, "IP роутера", "", InputType.TYPE_CLASS_PHONE);
+        port = field(credentials, "SSH-порт", "22", InputType.TYPE_CLASS_NUMBER);
+        user = field(credentials, "Логин", "root", InputType.TYPE_CLASS_TEXT);
+        password = field(credentials, "Пароль SSH", "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         password.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
-        start = button(form, "Разрешить доступ на час", () -> {
+        start = button(credentials, "Войти на роутер", () -> {
             if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
                 requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
             else begin();
         });
+        startAccess = button(form, "Разрешить доступ на час", SupportService::openAccess);
         stop = button(form, "Завершить доступ", () -> startService(new Intent(this, SupportService.class).setAction(SupportService.STOP)));
         copy = button(form, "Скопировать данные для поддержки", () -> {
             String detail = SupportService.details;
@@ -90,11 +106,13 @@ public final class MainActivity extends Activity {
             getSystemService(ClipboardManager.class).setPrimaryClip(clip);
             Toast.makeText(this, "Данные скопированы", Toast.LENGTH_SHORT).show();
         });
-        state = new TextView(this);
-        state.setTextSize(16);
-        state.setTextIsSelectable(true);
-        state.setPadding(0, padding / 2, 0, 0);
-        form.addView(state);
+        share = button(form, "Поделиться", () -> {
+            String detail = SupportService.details;
+            if (detail.isEmpty()) return;
+            Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(Intent.EXTRA_TEXT, "Временный доступ KatoVPN\n" + detail);
+            startActivity(Intent.createChooser(send, "Передать данные поддержки"));
+        });
     }
 
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
@@ -115,6 +133,8 @@ public final class MainActivity extends Activity {
         }
         byte[] secret = password.getText().toString().getBytes(StandardCharsets.UTF_8);
         password.getText().clear();
+        getSystemService(android.view.inputmethod.InputMethodManager.class)
+            .hideSoftInputFromWindow(password.getWindowToken(), 0);
         if (!SupportService.queue(new SupportService.Request(ip, login, sshPort, secret))) {
             Arrays.fill(secret, (byte) 0);
             return;

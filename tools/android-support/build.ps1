@@ -67,7 +67,7 @@ try {
 } finally { $archive.Dispose() }
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-$apk = Join-Path (Resolve-Path -LiteralPath $OutputDirectory).Path 'KatoVPN-Router-Support-v0.1.0-preview.apk'
+$apk = Join-Path (Resolve-Path -LiteralPath $OutputDirectory).Path 'KatoVPN-Router-Support-v0.1.1-preview.apk'
 Invoke-BuildTool (Join-Path $tools 'zipalign.exe') @('-f','4',$unsigned,$aligned)
 Invoke-BuildTool (Join-Path $tools 'apksigner.bat') @('sign','--ks',$Keystore,'--ks-key-alias','katovpn-support','--ks-pass','env:KATO_ANDROID_SIGN_PASSWORD','--out',$apk,$aligned)
 Invoke-BuildTool (Join-Path $tools 'apksigner.bat') @('verify','--verbose','--print-certs',$apk)

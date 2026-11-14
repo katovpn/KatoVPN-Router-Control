@@ -17,12 +17,29 @@ import org.json.JSONObject;
 
 public final class SupportService extends Service {
     static final String STOP = "app.katovpn.support.STOP";
-    static volatile boolean busy, stopping;
+    static volatile boolean busy, stopping, signedIn, opening;
     static volatile String status = "", details = "", fingerprint;
     static volatile long deadline;
     private static volatile boolean accepted;
     private static volatile CountDownLatch consent;
     private static Request queued;
+    private static final Object accessLock = new Object();
+
+    static void openAccess() {
+        synchronized (accessLock) {
+            if (!signedIn || opening || stopping) return;
+            opening = true;
+            accessLock.notifyAll();
+        }
+    }
+
+    private static void cancelAccess() {
+        synchronized (accessLock) {
+            stopping = true;
+            accessLock.notifyAll();
+        }
+        reply(false);
+    }
 
     static final class Request {
         final String host, user;
@@ -37,7 +54,9 @@ public final class SupportService extends Service {
         if (busy) return false;
         busy = true;
         stopping = false;
-        status = "Подключение…";
+        signedIn = false;
+        opening = false;
+        status = "Входим на роутер…";
         queued = request;
         return true;
     }
@@ -75,8 +94,7 @@ public final class SupportService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int id) {
         if (intent != null && STOP.equals(intent.getAction())) {
-            stopping = true;
-            reply(false);
+            cancelAccess();
             if (!busy) stopSelf(id);
             return START_NOT_STICKY;
         }
@@ -106,6 +124,7 @@ public final class SupportService extends Service {
         ConnectivityManager networks = getSystemService(ConnectivityManager.class);
         ConnectivityManager.NetworkCallback watcher = null;
         String result = "Доступ завершён.";
+        String stage = "Не удалось войти на роутер.";
         try (InputStream config = getAssets().open("support-relay.json")) {
             Network wifi = null;
             for (Network network : networks.getAllNetworks()) {
@@ -120,8 +139,7 @@ public final class SupportService extends Service {
             watcher = new ConnectivityManager.NetworkCallback() {
                 @Override public void onLost(Network network) {
                     if (selected.equals(network)) {
-                        stopping = true;
-                        reply(false);
+                        cancelAccess();
                     }
                 }
             };
@@ -131,16 +149,54 @@ public final class SupportService extends Service {
             int size = config.read(buffer);
             connection = new SupportConnection(request.host, request.port, request.user,
                 new JSONObject(new String(buffer, 0, size, StandardCharsets.UTF_8)), selected);
-            details = connection.start(request.password, this::confirm, () -> stopping);
+            android.content.SharedPreferences known = getSharedPreferences("router_host_keys", MODE_PRIVATE);
+            String endpoint = request.host + ":" + request.port;
+            String remembered = known.getString(endpoint, null);
+            String[] observed = {null};
+            connection.login(request.password, value -> {
+                observed[0] = value;
+                return remembered == null ? confirm(value) : remembered.equals(value);
+            });
+            if (remembered == null && observed[0] != null) known.edit().putString(endpoint, observed[0]).apply();
+            status = "Вход выполнен. Теперь можно открыть временный доступ.";
+            while (true) {
+                synchronized (accessLock) {
+                    signedIn = true;
+                    long idleDeadline = SystemClock.elapsedRealtime() + 300000;
+                    while (!opening && !stopping && connection.loggedIn() && SystemClock.elapsedRealtime() < idleDeadline)
+                        accessLock.wait(500);
+                }
+                if (stopping || !opening || !connection.loggedIn()) {
+                    result = stopping ? "Вход завершён." : "Вход истёк или связь с роутером прервалась. Войдите снова.";
+                    return;
+                }
+                stage = "Не удалось открыть временный доступ.";
+                status = "Создаём временный доступ…";
+                try {
+                    details = connection.start(() -> stopping);
+                    break;
+                } catch (Exception error) {
+                    if (!connection.closeAccess()) {
+                        result = "Туннель закрыт. Сервер или роутер не подтвердил очистку временного доступа.";
+                        return;
+                    }
+                    if (stopping || !connection.loggedIn()) throw error;
+                    synchronized (accessLock) {
+                        status = stage + " " + errorMessage(error) + " Можно повторить без ввода пароля.";
+                        opening = false;
+                    }
+                }
+            }
             deadline = connection.deadline;
             status = "Временный доступ активен";
             getSystemService(NotificationManager.class).notify(1, notification(status));
             while (!stopping && connection.active() && SystemClock.elapsedRealtime() < deadline) Thread.sleep(250);
             if (!stopping && SystemClock.elapsedRealtime() < deadline) result = "Связь прервалась. Доступ закрыт.";
         } catch (Exception e) {
-            result = stopping ? "Доступ отменён." : "Не удалось открыть доступ. " +
-                (e.getClass() == java.io.IOException.class ? e.getMessage() : "Проверьте SSH и связь с сервером.");
+            result = stopping ? "Доступ отменён." : stage + " " + errorMessage(e);
         } finally {
+            signedIn = false;
+            opening = false;
             if (watcher != null) {
                 try { networks.unregisterNetworkCallback(watcher); } catch (IllegalArgumentException ignored) {}
             }
@@ -158,6 +214,10 @@ public final class SupportService extends Service {
         }
     }
 
+    private static String errorMessage(Exception e) {
+        return e.getClass() == java.io.IOException.class ? e.getMessage() : "Проверьте Wi-Fi и связь с сервером.";
+    }
+
     private Notification notification(String text) {
         int flags = PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), flags);
@@ -169,8 +229,7 @@ public final class SupportService extends Service {
     }
 
     @Override public void onDestroy() {
-        stopping = true;
-        reply(false);
+        cancelAccess();
         super.onDestroy();
     }
 }

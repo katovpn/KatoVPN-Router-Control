@@ -25,6 +25,7 @@ final class SupportConnection {
     private final JSch jsch = new JSch();
     private Session router, relay;
     private String leaseId, revokeToken, cleanup;
+    private boolean leaseRequestUnconfirmed;
     long deadline;
 
     SupportConnection(String host, int port, String user, JSONObject config, Network wifi) throws Exception {
@@ -51,7 +52,7 @@ final class SupportConnection {
         JSch.setConfig("signature.ed25519", "com.jcraft.jsch.bc.SignatureEd25519");
     }
 
-    String start(byte[] password, Consent consent, BooleanSupplier cancelled) throws Exception {
+    void login(byte[] password, Consent consent) throws Exception {
         router = jsch.getSession(user, host, port);
         router.setSocketFactory(lanSockets);
         pin(router, consent);
@@ -59,12 +60,22 @@ final class SupportConnection {
         try {
             router.setPassword(password);
             router.connect(10000);
+        } catch (JSchException e) {
+            String message = String.valueOf(e.getMessage());
+            if (message.contains("HostKey") || message.contains("hostkey")) {
+                throw new IOException("SSH-ключ не подтверждён или изменился. Проверьте, что телефон подключён к нужному роутеру.");
+            }
+            if (message.startsWith("Auth")) throw new IOException("Роутер не принял логин или пароль SSH.");
+            throw new IOException("Не удалось установить SSH-соединение. Проверьте адрес и порт роутера.");
         } finally {
             Arrays.fill(password, (byte) 0);
             router.setPassword((byte[]) null);
         }
         router.setServerAliveInterval(15000);
         router.setServerAliveCountMax(2);
+    }
+
+    String start(BooleanSupplier cancelled) throws Exception {
         checkCancelled(cancelled);
         long routerTime = Long.parseLong(run("set -e; [ \"$(id -u)\" = 0 ]; [ -d /etc/dropbear ]; "
             + "[ -x /etc/init.d/cron ]; ls /etc/rc.d/S*cron >/dev/null; command -v timeout >/dev/null; date +%s").trim());
@@ -78,12 +89,14 @@ final class SupportConnection {
             try { jsch.addIdentity("temporary-support", raw, null, null); }
             finally { Arrays.fill(raw, (byte) 0); privateKey.reset(); }
             String publicKey = keyLine("ssh-rsa", key.getPublicKeyBlob());
+            leaseRequestUnconfirmed = true;
             JSONObject lease = request("POST", "/support/sessions", new JSONObject()
                 .put("client_public_key", publicKey).put("duration_seconds", 3600), null);
             String id = match(lease, "session_id", "[A-Za-z0-9_-]{8,64}");
             String token = match(lease, "revoke_token", "[A-Za-z0-9._~-]{24,256}");
             leaseId = id;
             revokeToken = token;
+            leaseRequestUnconfirmed = false;
             checkCancelled(cancelled);
             long expiry = lease.getLong("expires_at");
             long phone = now();
@@ -103,13 +116,15 @@ final class SupportConnection {
                 match(lease, "relay_host", "[A-Za-z0-9.-]{1,253}"), port(lease, "relay_port"));
             pin(relay, relayPin::equals);
             relay.setConfig("PreferredAuthentications", "publickey");
-            relay.connect(10000);
+            try { relay.connect(10000); }
+            catch (JSchException e) { throw new IOException("Не удалось открыть SSH-соединение с сервером поддержки."); }
             relay.setServerAliveInterval(10000);
             relay.setServerAliveCountMax(2);
             checkCancelled(cancelled);
             installKey(id, stopAt, supportKey);
             checkCancelled(cancelled);
-            relay.setPortForwardingR(bind, bindPort, host, port, lanSockets);
+            try { relay.setPortForwardingR(bind, bindPort, host, port, lanSockets); }
+            catch (JSchException e) { throw new IOException("Сервер поддержки не открыл порт туннеля."); }
             return "Код: " + code + "\nСервер: " + address + "\nПорт: " + supportPort + "\nЛогин роутера: " + user;
         } finally {
             jsch.removeAllIdentity();
@@ -118,14 +133,23 @@ final class SupportConnection {
     }
 
     boolean active() { return router != null && router.isConnected() && relay != null && relay.isConnected(); }
+    boolean loggedIn() { return router != null && router.isConnected(); }
 
     private static void checkCancelled(BooleanSupplier cancelled) throws IOException {
         if (cancelled.getAsBoolean()) throw new IOException("Доступ отменён.");
     }
 
     boolean close() {
-        boolean clean = true;
-        if (relay != null) relay.disconnect();
+        try { return closeAccess(); }
+        finally { if (router != null) router.disconnect(); }
+    }
+
+    boolean closeAccess() {
+        boolean clean = !leaseRequestUnconfirmed;
+        if (relay != null) {
+            relay.disconnect();
+            relay = null;
+        }
         if (revokeToken != null) {
             try { request("DELETE", "/support/sessions/" + leaseId, null, revokeToken); }
             catch (Exception e) { clean = false; }
@@ -133,8 +157,9 @@ final class SupportConnection {
         }
         if (cleanup != null) {
             try { run(cleanup); } catch (Exception e) { clean = false; }
+            cleanup = null;
         }
-        if (router != null) router.disconnect();
+        deadline = 0;
         return clean;
     }
 
@@ -205,6 +230,8 @@ final class SupportConnection {
                 try (OutputStream output = connection.getOutputStream()) { output.write(body.toString().getBytes(StandardCharsets.UTF_8)); }
             }
             int status = connection.getResponseCode();
+            if (body != null && (status == 400 || status == 401 || status == 403 || status == 429))
+                leaseRequestUnconfirmed = false;
             if (token != null && (status == 200 || status == 202 || status == 204 || status == 404 || status == 410)) return null;
             if (body == null || status != 200 && status != 201) throw new IOException("Сервер поддержки ответил HTTP " + status + ".");
             try (InputStream input = connection.getInputStream()) {
