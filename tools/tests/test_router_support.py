@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -87,6 +88,9 @@ class FakeTunnel:
     def is_active(self) -> bool:
         return self.started and not self.closed
 
+    def router_reachable(self) -> bool:
+        return True
+
 
 class RouterSupportTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -103,6 +107,156 @@ class RouterSupportTests(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual("https://router-support.katovpn.app/v1", config.api_url)
         self.assertRegex(config.relay_host_key_sha256, r"^SHA256:[A-Za-z0-9+/]{43}$")
+
+    def test_disconnected_tunnel_recovers_with_same_lease(self) -> None:
+        relay = FakeRelay()
+        first, replacement = FakeTunnel(), FakeTunnel()
+        tunnels = iter((first, replacement))
+        factory_args = []
+        installed = []
+        recovered = threading.Event()
+
+        def factory(**kwargs):
+            factory_args.append(kwargs)
+            return next(tunnels)
+
+        def start_replacement():
+            replacement.started = True
+
+        def probe_replacement():
+            recovered.set()
+            return True
+
+        replacement.start = start_replacement
+        replacement.router_reachable = probe_replacement
+        manager = SupportSessionManager(
+            self.config, relay_client=relay, tunnel_factory=factory,
+            install_key=lambda *args: installed.append(args), remove_key=lambda *args: None,
+            timer_factory=FakeTimer, now=lambda: 4102441200, monitor_interval_seconds=0.02,
+        )
+        self.addCleanup(manager.shutdown)
+        original = manager.start(self.spec, "SHA256:router", router_username="root")
+        first.close()
+        self.assertTrue(recovered.wait(1))
+        self.assertEqual(original, manager.public_status())
+        self.assertEqual(1, len(installed))
+        self.assertEqual([], relay.revoked)
+        self.assertIs(factory_args[0]["lease"], factory_args[1]["lease"])
+        self.assertIs(factory_args[0]["client_key"], factory_args[1]["client_key"])
+
+    def test_router_outage_keeps_forward_then_releases_lease(self) -> None:
+        relay = FakeRelay()
+        tunnel = FakeTunnel()
+        first_probe = threading.Event()
+        removed = threading.Event()
+
+        def unreachable():
+            first_probe.set()
+            return False
+
+        tunnel.router_reachable = unreachable
+        manager = SupportSessionManager(
+            self.config, relay_client=relay, tunnel_factory=lambda **_: tunnel,
+            install_key=lambda *args: None, remove_key=lambda *args: removed.set(),
+            timer_factory=FakeTimer, now=lambda: 4102441200,
+            monitor_interval_seconds=0.01, recovery_window_seconds=0.15,
+        )
+        self.addCleanup(manager.shutdown)
+        original = manager.start(self.spec, "SHA256:router", router_username="root")
+        self.assertTrue(first_probe.wait(1))
+        self.assertEqual(original, manager.public_status())
+        self.assertTrue(removed.wait(2))
+        self.assertTrue(tunnel.closed)
+        self.assertEqual(1, len(relay.revoked))
+        self.assertEqual("inactive", manager.public_status()["status"])
+
+    def test_router_returns_without_replacing_live_forward(self) -> None:
+        relay = FakeRelay()
+        tunnel = FakeTunnel()
+        returned = threading.Event()
+        probes = iter((False, True))
+        creations = []
+
+        def probe():
+            reachable = next(probes, True)
+            if reachable:
+                returned.set()
+            return reachable
+
+        def factory(**kwargs):
+            creations.append(kwargs)
+            return tunnel
+
+        tunnel.router_reachable = probe
+        manager = SupportSessionManager(
+            self.config, relay_client=relay, tunnel_factory=factory,
+            install_key=lambda *args: None, remove_key=lambda *args: None,
+            timer_factory=FakeTimer, now=lambda: 4102441200, monitor_interval_seconds=0.01,
+        )
+        self.addCleanup(manager.shutdown)
+        original = manager.start(self.spec, "SHA256:router", router_username="root")
+        self.assertTrue(returned.wait(1))
+        self.assertEqual(original, manager.public_status())
+        self.assertFalse(tunnel.closed)
+        self.assertEqual(1, len(creations))
+        self.assertEqual([], relay.revoked)
+
+    def test_stop_while_recovery_is_connecting_discards_replacement(self) -> None:
+        first, next_tunnel = FakeTunnel(), FakeTunnel()
+        tunnels = iter((first, next_tunnel))
+        connecting, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+        def start_replacement():
+            connecting.set()
+            release.wait(2)
+            next_tunnel.started = True
+
+        def close_replacement():
+            next_tunnel.closed = True
+            closed.set()
+
+        next_tunnel.start = start_replacement
+        next_tunnel.close = close_replacement
+        relay = FakeRelay()
+        manager = SupportSessionManager(
+            self.config, relay_client=relay, tunnel_factory=lambda **_: next(tunnels),
+            install_key=lambda *args: None, remove_key=lambda *args: None,
+            timer_factory=FakeTimer, now=lambda: 4102441200, monitor_interval_seconds=0.01,
+        )
+        self.addCleanup(manager.shutdown)
+        self.addCleanup(release.set)
+        manager.start(self.spec, "SHA256:router", router_username="root")
+        first.close()
+        self.assertTrue(connecting.wait(1))
+        self.assertEqual("inactive", manager.stop()["status"])
+        release.set()
+        self.assertTrue(closed.wait(1))
+        self.assertEqual(1, len(relay.revoked))
+
+    def test_expired_lease_never_reconnects(self) -> None:
+        relay = FakeRelay()
+        tunnel = FakeTunnel()
+        now = [4102441200]
+        removed = threading.Event()
+        attempts = []
+
+        def factory(**kwargs):
+            attempts.append(kwargs)
+            return tunnel
+
+        manager = SupportSessionManager(
+            self.config, relay_client=relay, tunnel_factory=factory,
+            install_key=lambda *args: None, remove_key=lambda *args: removed.set(),
+            timer_factory=FakeTimer, now=lambda: now[0], monitor_interval_seconds=0.02,
+        )
+        self.addCleanup(manager.shutdown)
+        original = manager.start(self.spec, "SHA256:router", router_username="root")
+        now[0] = original["expires_at"]
+        tunnel.close()
+        self.assertTrue(removed.wait(1))
+        self.assertEqual(1, len(attempts))
+        self.assertEqual(1, len(relay.revoked))
+        self.assertEqual("inactive", manager.public_status()["status"])
 
     def test_support_key_validation_accepts_one_public_key_and_rejects_options_or_multiline(self) -> None:
         normalized = validate_support_public_key(SUPPORT_KEY)

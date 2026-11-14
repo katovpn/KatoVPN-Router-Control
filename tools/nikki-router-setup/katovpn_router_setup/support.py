@@ -54,6 +54,8 @@ class Tunnel(Protocol):
 
     def is_active(self) -> bool: ...
 
+    def router_reachable(self) -> bool: ...
+
 
 def _validate_support_session_id(value: str) -> str:
     value = str(value)
@@ -401,9 +403,11 @@ class ReverseSshTunnel:
     def start(self) -> None:
         sock: socket.socket | None = None
         transport: paramiko.Transport | None = None
+        forward_timer: threading.Timer | None = None
         try:
             sock = socket.create_connection((self.lease["relay_host"], self.lease["relay_port"]), timeout=10)
             transport = paramiko.Transport(sock)
+            transport.auth_timeout = 8
             transport.start_client(timeout=10)
             server_key = transport.get_remote_server_key()
             if not secrets.compare_digest(self.config.relay_host_key_sha256, _server_key_fingerprint(server_key)):
@@ -412,7 +416,12 @@ class ReverseSshTunnel:
             if not transport.is_authenticated():
                 raise SetupError("support_relay_auth", "Сервер поддержки не принял временный ключ приложения.")
             transport.set_keepalive(15)
+            forward_timer = threading.Timer(8, transport.close)
+            forward_timer.daemon = True
+            forward_timer.start()
             transport.request_port_forward(self.lease["bind_host"], self.lease["bind_port"], handler=self._handle_channel)
+            if not transport.is_active():
+                raise SetupError("relay_tunnel_failed", "Сервер поддержки не подтвердил открытие порта.")
             with self._lock:
                 self.transport = transport
             transport = None
@@ -422,6 +431,8 @@ class ReverseSshTunnel:
         except (OSError, socket.timeout, paramiko.SSHException) as exc:
             raise SetupError("relay_tunnel_failed", "Не удалось открыть защищённый туннель поддержки.") from exc
         finally:
+            if forward_timer is not None:
+                forward_timer.cancel()
             if transport is not None:
                 transport.close()
             elif sock is not None:
@@ -461,16 +472,38 @@ class ReverseSshTunnel:
             self.transport = None
         if transport is None:
             return
-        try:
-            transport.cancel_port_forward(self.lease["bind_host"], self.lease["bind_port"])
-        except (OSError, paramiko.SSHException):
-            pass
+        # Closing the SSH connection also releases its remote forward. A
+        # cancellation RPC would wait for the same server that may be offline.
         transport.close()
 
     def is_active(self) -> bool:
         with self._lock:
             transport = self.transport
-        return bool(transport and transport.is_active() and transport.is_authenticated())
+        if not transport or not transport.is_active() or not transport.is_authenticated():
+            return False
+        answered = threading.Event()
+
+        def probe() -> None:
+            try:
+                # SSH_MSG_REQUEST_FAILURE still proves the peer responded.
+                transport.global_request("keepalive@openssh.com", wait=True)
+                if transport.is_active():
+                    answered.set()
+            except (OSError, EOFError, paramiko.SSHException):
+                pass
+
+        threading.Thread(target=probe, name="kato-support-probe", daemon=True).start()
+        if answered.wait(5):
+            return True
+        transport.close()
+        return False
+
+    def router_reachable(self) -> bool:
+        try:
+            with socket.create_connection((self.router_spec.host, self.router_spec.port), timeout=2):
+                return True
+        except OSError:
+            return False
 
 
 def _normalize_lease(raw: Mapping[str, Any], *, now: int) -> dict[str, Any]:
@@ -525,6 +558,7 @@ class SupportSessionManager:
         key_factory: Callable[[], paramiko.PKey] = lambda: paramiko.RSAKey.generate(3072),
         now: Callable[[], float] = time.time,
         monitor_interval_seconds: float = 3.0,
+        recovery_window_seconds: float = 90.0,
     ) -> None:
         self.config = config or load_support_relay_config()
         self.relay_client = relay_client or SupportRelayApiClient(self.config)
@@ -535,6 +569,7 @@ class SupportSessionManager:
         self.key_factory = key_factory
         self.now = now
         self.monitor_interval_seconds = monitor_interval_seconds
+        self.recovery_window_seconds = recovery_window_seconds
         self.lock = threading.Lock()
         self.active: dict[str, Any] | None = None
         self.starting = False
@@ -584,14 +619,17 @@ class SupportSessionManager:
             key_installed = True
             tunnel = self.tunnel_factory(config=self.config, lease=lease, client_key=client_key, router_spec=spec)
             tunnel.start()
-            timer = self.timer_factory(max(1, lease["expires_at"] - self.now()), self._expire)
-            timer.daemon = True
-            timer.start()
             monitor_stop = threading.Event()
+            timer = self.timer_factory(
+                max(1, lease["expires_at"] - self.now()),
+                lambda: self.stop(reason="expired", expected_stop_event=monitor_stop),
+            )
+            timer.daemon = True
             with self.lock:
                 self.active = {
                     "lease": lease,
                     "tunnel": tunnel,
+                    "client_key": client_key,
                     "timer": timer,
                     "spec": spec,
                     "fingerprint": fingerprint,
@@ -599,6 +637,7 @@ class SupportSessionManager:
                     "monitor_stop": monitor_stop,
                 }
                 self.starting = False
+            timer.start()
             threading.Thread(
                 target=self._monitor_tunnel,
                 args=(lease["session_id"], monitor_stop),
@@ -638,32 +677,81 @@ class SupportSessionManager:
             with self.lock:
                 self.starting = False
 
-    def _expire(self) -> None:
-        self.stop(reason="expired")
-
     def _monitor_tunnel(self, session_id: str, stop_event: threading.Event) -> None:
+        router_down_since = None
         while not stop_event.wait(self.monitor_interval_seconds):
             with self.lock:
                 active = self.active
-            if not active or active["lease"]["session_id"] != session_id:
+            if not active or active["lease"]["session_id"] != session_id or active["monitor_stop"] is not stop_event:
+                return
+            if self.now() >= active["lease"]["expires_at"]:
+                self.stop(reason="expired", expected_stop_event=stop_event)
                 return
             try:
                 tunnel_active = active["tunnel"].is_active()
             except Exception:
                 tunnel_active = False
             if not tunnel_active:
-                self.stop(reason="relay_disconnected")
+                if not self._recover_tunnel(active, stop_event):
+                    self.stop(reason="relay_disconnected", expected_stop_event=stop_event)
+                    return
+            if stop_event.is_set():
+                return
+            # Keep the existing forward during a short router reboot. Each new
+            # support connection opens a fresh socket to the router's SSH port.
+            try:
+                router_reachable = active["tunnel"].router_reachable()
+            except Exception:
+                router_reachable = False
+            if router_reachable:
+                router_down_since = None
+            elif router_down_since is None:
+                router_down_since = time.monotonic()
+            elif time.monotonic() - router_down_since >= self.recovery_window_seconds:
+                self.stop(reason="router_unreachable", expected_stop_event=stop_event)
                 return
 
-    def stop(self, *, reason: str = "manual") -> dict[str, Any]:
+    def _recover_tunnel(self, active: dict[str, Any], stop_event: threading.Event) -> bool:
+        lease = active["lease"]
+        retry_until = time.monotonic() + self.recovery_window_seconds
+        try:
+            active["tunnel"].close()
+        except Exception:
+            return False
+        while not stop_event.is_set() and self.now() < lease["expires_at"] and time.monotonic() < retry_until:
+            replacement = None
+            try:
+                replacement = self.tunnel_factory(
+                    config=self.config, lease=lease, client_key=active["client_key"], router_spec=active["spec"],
+                )
+                replacement.start()
+                with self.lock:
+                    if self.active is active and not stop_event.is_set() and self.now() < lease["expires_at"] and time.monotonic() < retry_until:
+                        active["tunnel"] = replacement
+                        return True
+            except Exception:
+                pass
+            if replacement is not None:
+                try:
+                    replacement.close()
+                except Exception:
+                    return False
+            if stop_event.wait(min(self.monitor_interval_seconds, max(0, retry_until - time.monotonic()))):
+                return False
+        return False
+
+    def stop(self, *, reason: str = "manual", expected_stop_event: threading.Event | None = None) -> dict[str, Any]:
         del reason
         with self.lock:
             active = self.active
-            self.active = None
+            if active and expected_stop_event is not None and active["monitor_stop"] is not expected_stop_event:
+                active = None
+            if active:
+                active["monitor_stop"].set()
+                self.active = None
         if not active:
             return self.public_status()
         warnings: list[str] = []
-        active["monitor_stop"].set()
         try:
             active["timer"].cancel()
         except Exception:
@@ -673,13 +761,13 @@ class SupportSessionManager:
         except Exception:
             warnings.append("Туннель закрылся без подтверждения приложения.")
         try:
-            self.remove_key(active["spec"], active["fingerprint"], active["lease"]["session_id"])
-        except Exception:
-            warnings.append("Ключ удалит независимый таймер роутера не позднее окончания часа.")
-        try:
             self.relay_client.revoke_session(active["lease"]["session_id"], active["lease"]["revoke_token"])
         except Exception:
             warnings.append("Сервер закроет сессию автоматически по сроку действия.")
+        try:
+            self.remove_key(active["spec"], active["fingerprint"], active["lease"]["session_id"])
+        except Exception:
+            warnings.append("Ключ удалит независимый таймер роутера не позднее окончания часа.")
         result = self.public_status()
         if warnings:
             result["warnings"] = warnings

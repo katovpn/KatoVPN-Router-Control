@@ -2,7 +2,7 @@ name: macOS preview
 
 on:
   push:
-    branches: [codex/macos-router-control]
+    branches: [codex/macos-router-control, codex/desktop-support-recovery]
   workflow_dispatch:
 
 permissions:

@@ -42,7 +42,7 @@ from .control import inspect_router
 from .support import SupportSessionManager
 
 
-APP_VERSION = "0.4.3-preview"
+APP_VERSION = "0.4.4-preview"
 MAX_REQUEST_BYTES = 16 * 1024
 PREFLIGHT_TTL_SECONDS = 10 * 60
 CLIENT_EXIT_GRACE_SECONDS = 4.0
