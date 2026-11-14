@@ -9,11 +9,11 @@ $AllowedRootFiles = @(
 )
 $AllowedHosts = @(
     'about.signpath.io', 'api.github.com', 'github.com', 'ifconfig.co', 'ipapi.co', 'ipwho.is',
-    'katovpn.app', 'nikkinikki.pages.dev', 'openwrt.org',
+    'katovpn.app', 'nikkinikki.pages.dev', 'openwrt.org', 'repo.maven.apache.org', 'schemas.android.com',
     'router-support.katovpn.app', 'signpath.org', 't.me'
 )
 $AllowedPublicIps = @('1.1.1.1', '8.8.8.8', '223.5.5.5', '223.6.6.6')
-$TextExtensions = @('.css', '.html', '.js', '.json', '.md', '.ps1', '.py', '.txt', '.uci', '.yml', '.yaml', '.xml')
+$TextExtensions = @('.css', '.html', '.java', '.js', '.json', '.md', '.ps1', '.py', '.txt', '.uci', '.yml', '.yaml', '.xml')
 $Violations = [System.Collections.Generic.List[string]]::new()
 
 $paths = @(& git -C $RepoRoot ls-files --cached --others --exclude-standard) |
