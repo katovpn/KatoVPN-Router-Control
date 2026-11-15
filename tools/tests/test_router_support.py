@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1] / "nikki-router-setup"
@@ -108,6 +108,44 @@ class RouterSupportTests(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual("https://router-support.katovpn.app/v1", config.api_url)
         self.assertRegex(config.relay_host_key_sha256, r"^SHA256:[A-Za-z0-9+/]{43}$")
+
+    def test_firmware_repair_preserves_live_lease_or_reinstalls_missing_files(self) -> None:
+        expires = int(time.time()) + 1800
+        for state in ("present", "missing"):
+            with self.subTest(state=state):
+                session = Mock(fingerprint="SHA256:router")
+                session.run.side_effect = [
+                    state, f"uid=0\ndropbear=1\ncron=1\ncron_enabled=1\ndaemon=1\ntimeout=1\nnow={int(time.time())}",
+                    "", "1", "",
+                ]
+                install_temporary_support_key(
+                    self.spec, "SHA256:router", SUPPORT_KEY, "session-12345678",
+                    expires, session_factory=lambda _: session, repair=True,
+                )
+                session.client.set_missing_host_key_policy.assert_called_once()
+                probe = session.run.call_args_list[0].args[0]
+                self.assertIn("/session.sh", probe)
+                self.assertIn("/cleanup.sh", probe)
+                self.assertIn(f"EXPIRES={expires}", probe)
+                if state == "present":
+                    session.write_file.assert_not_called()
+                else:
+                    session.write_file.assert_called_once()
+                    self.assertIn(f"EXPIRES={expires}", session.run.call_args_list[2].args[0])
+
+    def test_firmware_repair_rejects_changed_host_before_sending_credentials(self) -> None:
+        session = Mock()
+        session.connect.side_effect = lambda: session.client.set_missing_host_key_policy.call_args.args[0].missing_host_key(
+            session.client, self.spec.host, Mock(**{"asbytes.return_value": b"another router key"}),
+        )
+        with self.assertRaises(SetupError) as raised:
+            install_temporary_support_key(
+                self.spec, "SHA256:router", SUPPORT_KEY, "session-12345678",
+                int(time.time()) + 1800, session_factory=lambda _: session, repair=True,
+            )
+        self.assertEqual("router_fingerprint_changed", raised.exception.code)
+        session.run.assert_not_called()
+        session.write_file.assert_not_called()
 
     @patch("katovpn_router_setup.support.time", wraps=time)
     def test_disconnected_tunnel_recovers_with_same_lease_near_five_minutes(self, clock) -> None:

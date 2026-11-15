@@ -21,7 +21,7 @@ exe="$bundle/Contents/MacOS/$app"
 codesign --verify --deep --strict "$bundle"
 "$exe" --smoke-test --no-browser
 cd "$out"
-dmg="KatoVPN-Router-Control-v0.4.4-preview-macos-$arch.dmg"
+dmg="KatoVPN-Router-Control-v0.4.5-preview-macos-$arch.dmg"
 mkdir "$scratch/image" "$scratch/mount"
 ditto "$bundle" "$scratch/image/$app.app"
 hdiutil create -srcfolder "$scratch/image" -volname "$app" -format UDZO "$out/$dmg"

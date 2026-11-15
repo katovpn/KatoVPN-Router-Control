@@ -444,7 +444,7 @@ class RouterControlTests(unittest.TestCase):
         self.assertNotIn("WAN / DNS / HTTPS", html)
         self.assertNotIn("Пакетный менеджер", html)
         self.assertIn("Выгрузить логи", html)
-        self.assertEqual("0.4.4-preview", server_module.APP_VERSION)
+        self.assertEqual("0.4.5-preview", server_module.APP_VERSION)
         self.assertNotIn('id="server-count"', html)
         self.assertNotIn('id="location-count"', html)
         self.assertIn("Журнал VPN", html)

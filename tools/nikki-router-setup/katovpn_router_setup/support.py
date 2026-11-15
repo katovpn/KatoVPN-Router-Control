@@ -131,7 +131,7 @@ def load_support_relay_config(path: Path | None = None) -> SupportRelayConfig:
     return SupportRelayConfig(enabled=True, api_url=api_url, relay_host_key_sha256=host_key)
 
 
-def build_support_install_command(session_id: str, expires_at: int) -> str:
+def build_support_install_command(session_id: str, expires_at: int, *, repair: bool = False) -> str:
     session_id = _validate_support_session_id(session_id)
     try:
         expires_at = int(expires_at)
@@ -143,6 +143,7 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
     support_dir = f"{SUPPORT_ROOT}/{session_id}"
     cleanup = f"{support_dir}/cleanup.sh"
     session_shell = f"{support_dir}/session.sh"
+    upload = f"/tmp/kato-support-key-{session_id}" if repair else "/tmp/kato-support-key"
     delay = max(1, expires_at - int(time.time()))
     return (
         f"mkdir -p {shlex.quote(support_dir)} /etc/dropbear /etc/crontabs; "
@@ -195,7 +196,8 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
         f"touch {shlex.quote(SUPPORT_AUTHORIZED_KEYS)} {shlex.quote(SUPPORT_CRONTAB)}; "
         f"chmod 600 {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
         f"sed -i '\\| {marker}$|d' {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
-        f"cat /tmp/kato-support-key >> {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
+        f"printf '\\n' >> {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
+        f"cat {upload} >> {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
         f"cat > {shlex.quote(cleanup)} <<'KATO_SUPPORT_CLEANUP'\n"
         "#!/bin/sh\n"
         f"EXPIRES={expires_at}\n"
@@ -226,7 +228,7 @@ def build_support_install_command(session_id: str, expires_at: int) -> str:
         f"printf '%s\n' '* * * * * {cleanup} # {marker}' >> {shlex.quote(SUPPORT_CRONTAB)}; "
         "/etc/init.d/cron restart >/dev/null 2>&1; "
         f"start-stop-daemon -S -b -x /bin/sh -- -c 'sleep {delay}; {cleanup} --force' >/dev/null 2>&1; "
-        "rm -f /tmp/kato-support-key"
+        f"rm -f {upload}"
     )
 
 
@@ -244,6 +246,15 @@ def build_support_remove_command(session_id: str) -> str:
     )
 
 
+class _PinnedRouterPolicy(paramiko.MissingHostKeyPolicy):
+    def __init__(self, fingerprint: str) -> None:
+        self.fingerprint = fingerprint
+
+    def missing_host_key(self, client, hostname, key):
+        if not secrets.compare_digest(self.fingerprint, _server_key_fingerprint(key)):
+            raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился.")
+
+
 def install_temporary_support_key(
     spec: ConnectionSpec,
     expected_fingerprint: str,
@@ -252,15 +263,40 @@ def install_temporary_support_key(
     expires_at: int,
     *,
     session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
+    repair: bool = False,
 ) -> None:
     session_id = _validate_support_session_id(session_id)
     public_key = validate_support_public_key(public_key)
     marker = f"KatoVPN-Support-{session_id}"
     session = session_factory(spec)
+    wrote_key = False
+    upload = f"/tmp/kato-support-key-{session_id}" if repair else "/tmp/kato-support-key"
     try:
+        if repair or isinstance(session, RemoteSession):
+            session.client.set_missing_host_key_policy(_PinnedRouterPolicy(expected_fingerprint))
         session.connect()
         if not secrets.compare_digest(expected_fingerprint, session.fingerprint):
             raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Временный доступ не включён.")
+        session_shell = f"{SUPPORT_ROOT}/{session_id}/session.sh"
+        authorized_key = (
+            f'command="{session_shell}",no-agent-forwarding,no-X11-forwarding,no-port-forwarding '
+            f"{public_key} {marker}\n"
+        )
+        if repair:
+            cleanup = f"{SUPPORT_ROOT}/{session_id}/cleanup.sh"
+            expiry_line = shlex.quote(f"EXPIRES={int(expires_at)}")
+            cron_line = shlex.quote(f"* * * * * {cleanup} # {marker}")
+            state = session.run(
+                f"if grep -Fxq {shlex.quote(authorized_key.rstrip())} {SUPPORT_AUTHORIZED_KEYS} "
+                f"&& test -x {session_shell} && grep -Fxq {expiry_line} {session_shell} "
+                f"&& test -x {cleanup} && grep -Fxq {expiry_line} {cleanup} "
+                f"&& grep -Fxq {cron_line} {SUPPORT_CRONTAB}; then echo present; else echo missing; fi",
+                label="проверка ключа после переподключения",
+            )
+            if state.strip() == "present":
+                return
+            if state.strip() != "missing" or time.time() >= expires_at:
+                raise SetupError("support_repair_unavailable", "Не удалось подтвердить состояние временного доступа.")
         capabilities = session.run(
             "printf 'uid=%s\\n' \"$(id -u)\"; "
             "printf 'dropbear=%s\\n' \"$([ -d /etc/dropbear ] && echo 1 || echo 0)\"; "
@@ -292,14 +328,10 @@ def install_temporary_support_key(
         router_now = int(clock_match.group(1)) if clock_match else 0
         if abs(router_now - int(time.time())) > 300 or not router_now + 60 <= int(expires_at) <= router_now + SUPPORT_DURATION_SECONDS + 120:
             raise SetupError("support_router_clock", "Время на роутере неверное, поэтому безопасный часовой таймер не может быть включён.")
-        session_shell = f"{SUPPORT_ROOT}/{session_id}/session.sh"
-        authorized_key = (
-            f'command="{session_shell}",no-agent-forwarding,no-X11-forwarding,no-port-forwarding '
-            f"{public_key} {marker}\n"
-        )
-        session.write_file("/tmp/kato-support-key", authorized_key.encode("ascii"))
+        wrote_key = True
+        session.write_file(upload, authorized_key.encode("ascii"))
         session.run(
-            build_support_install_command(session_id, expires_at),
+            build_support_install_command(session_id, expires_at, repair=repair),
             label="временный ключ поддержки",
             timeout=25,
         )
@@ -311,10 +343,11 @@ def install_temporary_support_key(
             session.run(build_support_remove_command(session_id), label="отмена временного ключа", check=False)
             raise SetupError("support_key_not_installed", "Роутер не подтвердил временный ключ поддержки.")
     finally:
-        try:
-            session.run("rm -f /tmp/kato-support-key", label="очистка временного ключа", check=False)
-        except Exception:
-            pass
+        if wrote_key:
+            try:
+                session.run(f"rm -f {upload}", label="очистка временного ключа", check=False)
+            except Exception:
+                pass
         session.close()
 
 
@@ -328,6 +361,8 @@ def remove_temporary_support_key(
     session_id = _validate_support_session_id(session_id)
     session = session_factory(spec)
     try:
+        if isinstance(session, RemoteSession):
+            session.client.set_missing_host_key_policy(_PinnedRouterPolicy(expected_fingerprint))
         session.connect()
         if not secrets.compare_digest(expected_fingerprint, session.fingerprint):
             raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Временный ключ удалит таймер роутера.")
@@ -553,17 +588,21 @@ class SupportSessionManager:
         relay_client: RelayClient | None = None,
         tunnel_factory: Callable[..., Tunnel] = ReverseSshTunnel,
         install_key: Callable[..., None] = install_temporary_support_key,
+        repair_key: Callable[..., None] | None = None,
         remove_key: Callable[..., None] = remove_temporary_support_key,
         timer_factory: Callable[..., Any] = threading.Timer,
         key_factory: Callable[[], paramiko.PKey] = lambda: paramiko.RSAKey.generate(3072),
         now: Callable[[], float] = time.time,
         monitor_interval_seconds: float = 3.0,
-        recovery_window_seconds: float = 300.0,
+        recovery_window_seconds: float = SUPPORT_DURATION_SECONDS,
     ) -> None:
         self.config = config or load_support_relay_config()
         self.relay_client = relay_client or SupportRelayApiClient(self.config)
         self.tunnel_factory = tunnel_factory
         self.install_key = install_key
+        self.repair_key = repair_key
+        if repair_key is None and install_key is install_temporary_support_key:
+            self.repair_key = lambda *args: install_temporary_support_key(*args, repair=True)
         self.remove_key = remove_key
         self.timer_factory = timer_factory
         self.key_factory = key_factory
@@ -635,6 +674,7 @@ class SupportSessionManager:
                     "fingerprint": fingerprint,
                     "router_username": router_username,
                     "monitor_stop": monitor_stop,
+                    "repair_lock": threading.Lock(),
                 }
                 self.starting = False
             timer.start()
@@ -679,6 +719,7 @@ class SupportSessionManager:
 
     def _monitor_tunnel(self, session_id: str, stop_event: threading.Event) -> None:
         router_down_since = None
+        last_key_check = time.monotonic()
         while not stop_event.wait(self.monitor_interval_seconds):
             with self.lock:
                 active = self.active
@@ -703,6 +744,19 @@ class SupportSessionManager:
                 router_reachable = active["tunnel"].router_reachable()
             except Exception:
                 router_reachable = False
+            if router_reachable:
+                if self.repair_key and (router_down_since is not None or time.monotonic() - last_key_check >= 30):
+                    try:
+                        with active["repair_lock"]:
+                            if stop_event.is_set() or self.now() >= active["lease"]["expires_at"]:
+                                return
+                            lease = active["lease"]
+                            self.repair_key(active["spec"], active["fingerprint"], lease["support_public_key"],
+                                            session_id, lease["expires_at"])
+                    except Exception:
+                        router_reachable = False
+                    else:
+                        last_key_check = time.monotonic()
             if router_reachable:
                 router_down_since = None
             elif router_down_since is None:
@@ -765,7 +819,8 @@ class SupportSessionManager:
         except Exception:
             warnings.append("Сервер закроет сессию автоматически по сроку действия.")
         try:
-            self.remove_key(active["spec"], active["fingerprint"], active["lease"]["session_id"])
+            with active["repair_lock"]:
+                self.remove_key(active["spec"], active["fingerprint"], active["lease"]["session_id"])
         except Exception:
             warnings.append("Ключ удалит независимый таймер роутера не позднее окончания часа.")
         result = self.public_status()
