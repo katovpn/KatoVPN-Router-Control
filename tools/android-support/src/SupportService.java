@@ -135,20 +135,20 @@ public final class SupportService extends Service {
                 }
             }
             if (wifi == null) throw new java.io.IOException("Подключитесь к Wi-Fi роутера.");
-            Network selected = wifi;
+            byte[] buffer = new byte[4096];
+            int size = config.read(buffer);
+            SupportConnection session = new SupportConnection(request.host, request.port, request.user,
+                new JSONObject(new String(buffer, 0, size, StandardCharsets.UTF_8)), wifi, () -> stopping);
+            connection = session;
             watcher = new ConnectivityManager.NetworkCallback() {
                 @Override public void onLost(Network network) {
-                    if (selected.equals(network)) {
-                        cancelAccess();
-                    }
+                    if (!session.networkLost(network)) return;
+                    if (deadline == 0) cancelAccess();
+                    else synchronized (accessLock) { accessLock.notifyAll(); }
                 }
             };
             networks.registerNetworkCallback(new NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), watcher);
-            byte[] buffer = new byte[4096];
-            int size = config.read(buffer);
-            connection = new SupportConnection(request.host, request.port, request.user,
-                new JSONObject(new String(buffer, 0, size, StandardCharsets.UTF_8)), selected);
             android.content.SharedPreferences known = getSharedPreferences("router_host_keys", MODE_PRIVATE);
             String endpoint = request.host + ":" + request.port;
             String remembered = known.getString(endpoint, null);
@@ -173,7 +173,7 @@ public final class SupportService extends Service {
                 stage = "Не удалось открыть временный доступ.";
                 status = "Создаём временный доступ…";
                 try {
-                    details = connection.start(() -> stopping);
+                    details = session.start();
                     break;
                 } catch (Exception error) {
                     if (!connection.closeAccess()) {
@@ -189,9 +189,27 @@ public final class SupportService extends Service {
             }
             deadline = connection.deadline;
             status = "Временный доступ активен";
-            getSystemService(NotificationManager.class).notify(1, notification(status));
-            while (!stopping && connection.active() && SystemClock.elapsedRealtime() < deadline) Thread.sleep(250);
-            if (!stopping && SystemClock.elapsedRealtime() < deadline) result = "Связь прервалась. Доступ закрыт.";
+            NotificationManager notifications = getSystemService(NotificationManager.class);
+            notifications.notify(1, notification(status));
+            while (!stopping && SystemClock.elapsedRealtime() < deadline) {
+                if (session.active()) {
+                    synchronized (accessLock) {
+                        long remaining = deadline - SystemClock.elapsedRealtime();
+                        if (!stopping && remaining > 0) accessLock.wait(Math.min(3000, remaining));
+                    }
+                    continue;
+                }
+                status = "Восстанавливаем связь…";
+                notifications.notify(1, notification(status));
+                if (!SupportPolicy.recover(deadline, SystemClock::elapsedRealtime, () -> stopping,
+                    limit -> session.restore(networks, limit), Thread::sleep)) {
+                    if (!stopping && SystemClock.elapsedRealtime() < deadline)
+                        result = "Связь прервалась. Доступ закрыт.";
+                    break;
+                }
+                status = "Временный доступ активен";
+                notifications.notify(1, notification(status));
+            }
         } catch (Exception e) {
             result = stopping ? "Доступ отменён." : stage + " " + errorMessage(e);
         } finally {

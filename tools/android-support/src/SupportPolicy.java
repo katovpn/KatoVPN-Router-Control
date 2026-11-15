@@ -1,6 +1,27 @@
 package app.katovpn.support;
 
+import java.util.function.BooleanSupplier;
+import java.util.function.LongPredicate;
+import java.util.function.LongSupplier;
+
 final class SupportPolicy {
+    private static final long RECOVERY_MS = 300_000;
+
+    interface Pause { void waitMillis(long milliseconds) throws InterruptedException; }
+
+    static boolean recover(long expiry, LongSupplier clock, BooleanSupplier cancelled,
+                           LongPredicate attempt, Pause pause) throws InterruptedException {
+        long limit = Math.min(expiry, clock.getAsLong() + RECOVERY_MS);
+        while (!cancelled.getAsBoolean() && clock.getAsLong() < limit) {
+            boolean restored = attempt.test(limit);
+            long remaining = limit - clock.getAsLong();
+            if (remaining <= 0 || cancelled.getAsBoolean()) return false;
+            if (restored) return true;
+            pause.waitMillis(Math.min(1000, remaining));
+        }
+        return false;
+    }
+
     static boolean isLocalIpv4(String value) {
         if (!validIpv4(value)) return false;
         String[] parts = value.split("\\.");

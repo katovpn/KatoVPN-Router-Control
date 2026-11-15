@@ -1,7 +1,9 @@
 package app.katovpn.support;
 
 import android.os.SystemClock;
+import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import com.jcraft.jsch.*;
 import java.io.*;
 import java.net.URL;
@@ -11,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import javax.net.ssl.HttpsURLConnection;
 import org.json.JSONObject;
@@ -21,30 +24,28 @@ final class SupportConnection {
     final String host, user;
     final int port;
     private final String api, relayPin;
-    private final SocketFactory lanSockets;
-    private final JSch jsch = new JSch();
+    private final BooleanSupplier cancelled;
+    private final SocketFactory forwardSockets;
+    private final JSch routerSsh = new JSch();
+    private final JSch relaySsh = new JSch();
+    private final AtomicReference<Network> lanNetwork = new AtomicReference<>();
     private Session router, relay;
-    private String leaseId, revokeToken, cleanup;
+    private RelayEndpoint relayEndpoint;
+    private String leaseId, revokeToken, cleanup, routerPin;
     private boolean leaseRequestUnconfirmed;
-    long deadline;
+    private volatile boolean forwardReady;
+    volatile long deadline;
 
-    SupportConnection(String host, int port, String user, JSONObject config, Network wifi) throws Exception {
+    SupportConnection(String host, int port, String user, JSONObject config, Network wifi,
+                      BooleanSupplier cancelled) throws Exception {
         if (!SupportPolicy.isLocalIpv4(host) || port < 1 || port > 65535 || !user.matches("[A-Za-z0-9_.-]{1,32}"))
             throw new IOException("Проверьте локальный IP, порт и логин роутера.");
         this.host = host;
         this.port = port;
         this.user = user;
-        lanSockets = new SocketFactory() {
-            public Socket createSocket(String address, int sshPort) throws IOException {
-                Socket socket = wifi.getSocketFactory().createSocket();
-                try {
-                    socket.connect(new InetSocketAddress(address, sshPort), 8000);
-                    return socket;
-                } catch (IOException e) { socket.close(); throw e; }
-            }
-            public InputStream getInputStream(Socket socket) throws IOException { return socket.getInputStream(); }
-            public OutputStream getOutputStream(Socket socket) throws IOException { return socket.getOutputStream(); }
-        };
+        lanNetwork.set(wifi);
+        this.cancelled = cancelled;
+        forwardSockets = lanSockets(true);
         api = config.getString("api_url");
         relayPin = config.getString("relay_host_key_sha256");
         if (!api.startsWith("https://") || !relayPin.matches("SHA256:[A-Za-z0-9+/]{43}"))
@@ -53,9 +54,13 @@ final class SupportConnection {
     }
 
     void login(byte[] password, Consent consent) throws Exception {
-        router = jsch.getSession(user, host, port);
-        router.setSocketFactory(lanSockets);
-        pin(router, consent);
+        router = routerSsh.getSession(user, host, port);
+        router.setSocketFactory(lanSockets(false));
+        pin(router, fingerprint -> {
+            if (!consent.confirm(fingerprint)) return false;
+            routerPin = fingerprint;
+            return true;
+        });
         router.setConfig("PreferredAuthentications", "password");
         try {
             router.setPassword(password);
@@ -75,18 +80,18 @@ final class SupportConnection {
         router.setServerAliveCountMax(2);
     }
 
-    String start(BooleanSupplier cancelled) throws Exception {
-        checkCancelled(cancelled);
+    String start() throws Exception {
+        checkCancelled();
         long routerTime = Long.parseLong(run("set -e; [ \"$(id -u)\" = 0 ]; [ -d /etc/dropbear ]; "
             + "[ -x /etc/init.d/cron ]; ls /etc/rc.d/S*cron >/dev/null; command -v timeout >/dev/null; date +%s").trim());
         if (Math.abs(routerTime - now()) > 300) throw new IOException("Часы телефона и роутера расходятся.");
 
-        KeyPair key = KeyPair.genKeyPair(jsch, KeyPair.RSA, 3072);
+        KeyPair key = KeyPair.genKeyPair(relaySsh, KeyPair.RSA, 3072);
         try {
             ByteArrayOutputStream privateKey = new ByteArrayOutputStream();
             key.writePrivateKey(privateKey);
             byte[] raw = privateKey.toByteArray();
-            try { jsch.addIdentity("temporary-support", raw, null, null); }
+            try { relaySsh.addIdentity("temporary-support", raw, null, null); }
             finally { Arrays.fill(raw, (byte) 0); privateKey.reset(); }
             String publicKey = keyLine("ssh-rsa", key.getPublicKeyBlob());
             leaseRequestUnconfirmed = true;
@@ -97,7 +102,7 @@ final class SupportConnection {
             leaseId = id;
             revokeToken = token;
             leaseRequestUnconfirmed = false;
-            checkCancelled(cancelled);
+            checkCancelled();
             long expiry = lease.getLong("expires_at");
             long phone = now();
             if (expiry < phone + 60 || expiry > phone + 3720) throw new IOException("Неверный срок доступа.");
@@ -106,36 +111,188 @@ final class SupportConnection {
             if (!SupportPolicy.validExpiry(phone, routerNow, stopAt)) throw new IOException("Не удалось согласовать таймер доступа.");
             deadline = SystemClock.elapsedRealtime() + (stopAt - phone) * 1000;
             String supportKey = supportKey(lease.getString("support_public_key"));
-            String bind = lease.getString("bind_host");
-            if (!SupportPolicy.isLoopbackIpv4(bind)) throw new IOException("Сервер запросил небезопасный адрес туннеля.");
-            int bindPort = port(lease, "bind_port");
+            relayEndpoint = new RelayEndpoint(lease);
             String code = match(lease, "code", "[A-Z0-9-]{6,32}");
             String address = match(lease, "support_server", "[A-Za-z0-9.-]{1,253}");
             int supportPort = port(lease, "support_port");
-            relay = jsch.getSession(match(lease, "relay_username", "[A-Za-z0-9_.-]{1,32}"),
-                match(lease, "relay_host", "[A-Za-z0-9.-]{1,253}"), port(lease, "relay_port"));
-            pin(relay, relayPin::equals);
-            relay.setConfig("PreferredAuthentications", "publickey");
-            try { relay.connect(10000); }
+            try { relay = connectRelay(deadline); }
             catch (JSchException e) { throw new IOException("Не удалось открыть SSH-соединение с сервером поддержки."); }
-            relay.setServerAliveInterval(10000);
-            relay.setServerAliveCountMax(2);
-            checkCancelled(cancelled);
+            checkCancelled();
             installKey(id, stopAt, supportKey);
-            checkCancelled(cancelled);
-            try { relay.setPortForwardingR(bind, bindPort, host, port, lanSockets); }
+            checkCancelled();
+            if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("Срок доступа истёк.");
+            try { openForward(relay); }
             catch (JSchException e) { throw new IOException("Сервер поддержки не открыл порт туннеля."); }
+            checkCancelled();
+            if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("Срок доступа истёк.");
+            forwardReady = true;
             return "Код: " + code + "\nСервер: " + address + "\nПорт: " + supportPort + "\nЛогин роутера: " + user;
         } finally {
-            jsch.removeAllIdentity();
             key.dispose();
         }
     }
 
-    boolean active() { return router != null && router.isConnected() && relay != null && relay.isConnected(); }
     boolean loggedIn() { return router != null && router.isConnected(); }
 
-    private static void checkCancelled(BooleanSupplier cancelled) throws IOException {
+    boolean networkLost(Network network) {
+        Network selected = lanNetwork.get();
+        return network.equals(selected) && lanNetwork.compareAndSet(selected, null);
+    }
+
+    boolean active() {
+        return relay != null && relay.isConnected() && routerReachable(deadline);
+    }
+
+    boolean restore(ConnectivityManager networks, long limit) {
+        if (!allowed(limit)) return false;
+        forwardReady = false;
+        lanNetwork.set(null);
+        for (Network candidate : networks.getAllNetworks()) {
+            if (!allowed(limit)) return false;
+            if (isWifi(networks, candidate) && matchesRouter(candidate, limit)
+                && isWifi(networks, candidate) && allowed(limit)) {
+                lanNetwork.set(candidate);
+                break;
+            }
+        }
+        if (lanNetwork.get() == null || !allowed(limit)) return false;
+        if (relay != null && relay.isConnected()) {
+            forwardReady = true;
+            return true;
+        }
+        if (relay != null) relay.disconnect();
+        relay = null;
+        Session replacement = null;
+        try {
+            replacement = connectRelay(limit);
+            if (!allowed(limit) || lanNetwork.get() == null) return false;
+            openForward(replacement);
+            if (!allowed(limit) || lanNetwork.get() == null) return false;
+            relay = replacement;
+            forwardReady = true;
+            return true;
+        } catch (JSchException | IOException e) {
+            return false;
+        } finally {
+            if (replacement != null && relay != replacement) replacement.disconnect();
+        }
+    }
+
+    private static boolean isWifi(ConnectivityManager networks, Network network) {
+        NetworkCapabilities capabilities = networks.getNetworkCapabilities(network);
+        return capabilities != null && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+    }
+
+    private boolean routerReachable(long limit) {
+        Network selected = lanNetwork.get();
+        if (selected == null || SystemClock.elapsedRealtime() >= limit) return false;
+        try (Socket ignored = connectSocket(selected, host, port, timeout(limit, 1000))) {
+            return selected == lanNetwork.get();
+        } catch (IOException e) {
+            lanNetwork.compareAndSet(selected, null);
+            return false;
+        }
+    }
+
+    private boolean matchesRouter(Network network, long limit) {
+        Session probe = null;
+        boolean[] matched = {false};
+        try {
+            probe = new JSch().getSession(user, host, port);
+            probe.setSocketFactory(new SocketFactory() {
+                public Socket createSocket(String address, int sshPort) throws IOException {
+                    return connectSocket(network, address, sshPort, timeout(limit, 2500));
+                }
+                public InputStream getInputStream(Socket socket) throws IOException { return socket.getInputStream(); }
+                public OutputStream getOutputStream(Socket socket) throws IOException { return socket.getOutputStream(); }
+            });
+            pin(probe, fingerprint -> {
+                matched[0] = fingerprint.equals(routerPin);
+                return false; // Stop the handshake after verifying possession of the pinned key.
+            });
+            probe.connect(timeout(limit, 2500));
+        } catch (JSchException | IOException ignored) {
+            // Host-key rejection is expected because this probe never authenticates.
+        } finally {
+            if (probe != null) probe.disconnect();
+        }
+        return matched[0];
+    }
+
+    private SocketFactory lanSockets(boolean forwarding) {
+        return new SocketFactory() {
+            public Socket createSocket(String address, int sshPort) throws IOException {
+                Network selected = lanNetwork.get();
+                if (selected == null || (forwarding && (!forwardReady || !allowed(deadline))))
+                    throw new IOException("Временный доступ недоступен.");
+                int connectTimeout = forwarding ? timeout(deadline, 8000) : 8000;
+                Socket socket = connectSocket(selected, address, sshPort, connectTimeout);
+                if (selected != lanNetwork.get() || (forwarding && (!forwardReady || !allowed(deadline)))) {
+                    socket.close();
+                    throw new IOException("Временный доступ недоступен.");
+                }
+                return socket;
+            }
+            public InputStream getInputStream(Socket socket) throws IOException { return socket.getInputStream(); }
+            public OutputStream getOutputStream(Socket socket) throws IOException { return socket.getOutputStream(); }
+        };
+    }
+
+    private static Socket connectSocket(Network network, String host, int port, int timeout) throws IOException {
+        Socket socket = network.getSocketFactory().createSocket();
+        try {
+            socket.connect(new InetSocketAddress(host, port), timeout);
+            return socket;
+        } catch (IOException e) {
+            socket.close();
+            throw e;
+        }
+    }
+
+    private Session connectRelay(long limit) throws JSchException, IOException {
+        Session session = relaySsh.getSession(relayEndpoint.user, relayEndpoint.host, relayEndpoint.port);
+        pin(session, relayPin::equals);
+        session.setConfig("PreferredAuthentications", "publickey");
+        try {
+            session.connect(timeout(limit, 10000));
+            session.setServerAliveInterval(10000);
+            session.setServerAliveCountMax(2);
+            return session;
+        } catch (JSchException | IOException e) {
+            session.disconnect();
+            throw e;
+        }
+    }
+
+    private void openForward(Session session) throws JSchException {
+        session.setPortForwardingR(relayEndpoint.bind, relayEndpoint.bindPort, host, port, forwardSockets);
+    }
+
+    private static int timeout(long limit, int maximum) throws IOException {
+        long remaining = limit - SystemClock.elapsedRealtime();
+        if (remaining <= 0) throw new IOException("Срок доступа истёк.");
+        return (int) Math.min(maximum, remaining);
+    }
+
+    private boolean allowed(long limit) {
+        return !cancelled.getAsBoolean() && SystemClock.elapsedRealtime() < limit;
+    }
+
+    private static final class RelayEndpoint {
+        final String user, host, bind;
+        final int port, bindPort;
+
+        RelayEndpoint(JSONObject lease) throws Exception {
+            user = match(lease, "relay_username", "[A-Za-z0-9_.-]{1,32}");
+            host = match(lease, "relay_host", "[A-Za-z0-9.-]{1,253}");
+            port = port(lease, "relay_port");
+            bind = lease.getString("bind_host");
+            if (!SupportPolicy.isLoopbackIpv4(bind)) throw new IOException("Сервер запросил небезопасный адрес туннеля.");
+            bindPort = port(lease, "bind_port");
+        }
+    }
+
+    private void checkCancelled() throws IOException {
         if (cancelled.getAsBoolean()) throw new IOException("Доступ отменён.");
     }
 
@@ -145,11 +302,15 @@ final class SupportConnection {
     }
 
     boolean closeAccess() {
+        forwardReady = false;
         boolean clean = !leaseRequestUnconfirmed;
         if (relay != null) {
             relay.disconnect();
             relay = null;
         }
+        try { relaySsh.removeAllIdentity(); }
+        catch (JSchException e) { clean = false; }
+        relayEndpoint = null;
         if (revokeToken != null) {
             try { request("DELETE", "/support/sessions/" + leaseId, null, revokeToken); }
             catch (Exception e) { clean = false; }
