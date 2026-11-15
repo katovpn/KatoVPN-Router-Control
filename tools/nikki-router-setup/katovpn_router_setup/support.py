@@ -558,7 +558,7 @@ class SupportSessionManager:
         key_factory: Callable[[], paramiko.PKey] = lambda: paramiko.RSAKey.generate(3072),
         now: Callable[[], float] = time.time,
         monitor_interval_seconds: float = 3.0,
-        recovery_window_seconds: float = 90.0,
+        recovery_window_seconds: float = 300.0,
     ) -> None:
         self.config = config or load_support_relay_config()
         self.relay_client = relay_client or SupportRelayApiClient(self.config)

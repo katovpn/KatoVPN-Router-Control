@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1] / "nikki-router-setup"
@@ -108,26 +109,27 @@ class RouterSupportTests(unittest.TestCase):
         self.assertEqual("https://router-support.katovpn.app/v1", config.api_url)
         self.assertRegex(config.relay_host_key_sha256, r"^SHA256:[A-Za-z0-9+/]{43}$")
 
-    def test_disconnected_tunnel_recovers_with_same_lease(self) -> None:
+    @patch("katovpn_router_setup.support.time", wraps=time)
+    def test_disconnected_tunnel_recovers_with_same_lease_near_five_minutes(self, clock) -> None:
         relay = FakeRelay()
-        first, replacement = FakeTunnel(), FakeTunnel()
-        tunnels = iter((first, replacement))
+        first, failed, replacement = FakeTunnel(), FakeTunnel(fail=True), FakeTunnel()
+        tunnels = iter((first, failed, replacement))
+        clock.monotonic.return_value = 0.0
         factory_args = []
         installed = []
         recovered = threading.Event()
 
         def factory(**kwargs):
             factory_args.append(kwargs)
-            return next(tunnels)
-
-        def start_replacement():
-            replacement.started = True
+            tunnel = next(tunnels)
+            if tunnel is failed:
+                clock.monotonic.return_value = 299.0
+            return tunnel
 
         def probe_replacement():
             recovered.set()
             return True
 
-        replacement.start = start_replacement
         replacement.router_reachable = probe_replacement
         manager = SupportSessionManager(
             self.config, relay_client=relay, tunnel_factory=factory,
@@ -141,8 +143,9 @@ class RouterSupportTests(unittest.TestCase):
         self.assertEqual(original, manager.public_status())
         self.assertEqual(1, len(installed))
         self.assertEqual([], relay.revoked)
-        self.assertIs(factory_args[0]["lease"], factory_args[1]["lease"])
-        self.assertIs(factory_args[0]["client_key"], factory_args[1]["client_key"])
+        self.assertTrue(failed.closed)
+        self.assertIs(factory_args[0]["lease"], factory_args[2]["lease"])
+        self.assertIs(factory_args[0]["client_key"], factory_args[2]["client_key"])
 
     def test_router_outage_keeps_forward_then_releases_lease(self) -> None:
         relay = FakeRelay()
@@ -170,15 +173,17 @@ class RouterSupportTests(unittest.TestCase):
         self.assertEqual(1, len(relay.revoked))
         self.assertEqual("inactive", manager.public_status()["status"])
 
-    def test_router_returns_without_replacing_live_forward(self) -> None:
+    @patch("katovpn_router_setup.support.time", wraps=time)
+    def test_router_returns_near_five_minutes_without_replacing_live_forward(self, clock) -> None:
         relay = FakeRelay()
         tunnel = FakeTunnel()
         returned = threading.Event()
-        probes = iter((False, True))
+        probes = iter(((0.0, False), (299.0, False), (299.0, True)))
         creations = []
 
         def probe():
-            reachable = next(probes, True)
+            elapsed, reachable = next(probes, (299.0, True))
+            clock.monotonic.return_value = elapsed
             if reachable:
                 returned.set()
             return reachable
