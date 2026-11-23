@@ -5,16 +5,13 @@ import java.util.function.LongPredicate;
 import java.util.function.LongSupplier;
 
 final class SupportPolicy {
-    private static final long RECOVERY_MS = 300_000;
-
     interface Pause { void waitMillis(long milliseconds) throws InterruptedException; }
 
     static boolean recover(long expiry, LongSupplier clock, BooleanSupplier cancelled,
                            LongPredicate attempt, Pause pause) throws InterruptedException {
-        long limit = Math.min(expiry, clock.getAsLong() + RECOVERY_MS);
-        while (!cancelled.getAsBoolean() && clock.getAsLong() < limit) {
-            boolean restored = attempt.test(limit);
-            long remaining = limit - clock.getAsLong();
+        while (!cancelled.getAsBoolean() && clock.getAsLong() < expiry) {
+            boolean restored = attempt.test(expiry);
+            long remaining = expiry - clock.getAsLong();
             if (remaining <= 0 || cancelled.getAsBoolean()) return false;
             if (restored) return true;
             pause.waitMillis(Math.min(1000, remaining));
@@ -43,5 +40,9 @@ final class SupportPolicy {
         return router >= phone - 300 && router <= phone + 300
             && expiry >= Math.max(phone, router) + 60
             && expiry <= Math.min(phone, router) + 3600;
+    }
+
+    static long deadlineAt(long elapsedAtSample, long wallMillisAtSample, long expirySeconds) {
+        return elapsedAtSample + expirySeconds * 1000 - wallMillisAtSample;
     }
 }

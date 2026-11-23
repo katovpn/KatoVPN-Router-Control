@@ -134,11 +134,11 @@ public final class SupportService extends Service {
                     break;
                 }
             }
-            if (wifi == null) throw new java.io.IOException("Подключитесь к Wi-Fi роутера.");
+            if (wifi == null) throw new SupportConnection.UserError("Подключитесь к Wi-Fi роутера.");
             byte[] buffer = new byte[4096];
             int size = config.read(buffer);
             SupportConnection session = new SupportConnection(request.host, request.port, request.user,
-                new JSONObject(new String(buffer, 0, size, StandardCharsets.UTF_8)), wifi, () -> stopping);
+                new JSONObject(new String(buffer, 0, size, StandardCharsets.UTF_8)), wifi, networks, () -> stopping);
             connection = session;
             watcher = new ConnectivityManager.NetworkCallback() {
                 @Override public void onLost(Network network) {
@@ -202,7 +202,7 @@ public final class SupportService extends Service {
                 status = "Восстанавливаем связь…";
                 notifications.notify(1, notification(status));
                 if (!SupportPolicy.recover(deadline, SystemClock::elapsedRealtime, () -> stopping,
-                    limit -> session.restore(networks, limit), Thread::sleep)) {
+                    session::restore, Thread::sleep)) {
                     if (!stopping && SystemClock.elapsedRealtime() < deadline)
                         result = "Связь прервалась. Доступ закрыт.";
                     break;
@@ -233,7 +233,7 @@ public final class SupportService extends Service {
     }
 
     private static String errorMessage(Exception e) {
-        return e.getClass() == java.io.IOException.class ? e.getMessage() : "Проверьте Wi-Fi и связь с сервером.";
+        return e instanceof SupportConnection.UserError ? e.getMessage() : "Проверьте Wi-Fi и связь с сервером.";
     }
 
     private Notification notification(String text) {

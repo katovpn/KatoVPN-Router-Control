@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory)][string]$Sdk,
     [Parameter(Mandatory)][string]$Jdk,
     [Parameter(Mandatory)][string]$Keystore,
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist')
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist'),
+    [string]$TestShell,
+    [string]$TestPython
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,7 +42,14 @@ $aligned = Join-Path $work 'aligned.apk'
 $sources = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -Filter '*.java' -File | ForEach-Object FullName)
 $tests = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'test') -Filter '*.java' -File | ForEach-Object FullName)
 Invoke-BuildTool (Join-Path $bin 'javac.exe') (@('--release','11','-encoding','UTF-8','-cp',("$platform;" + ($dependencies -join ';')),'-d',$classes.FullName) + $sources + $tests)
-Invoke-BuildTool (Join-Path $bin 'java.exe') @('-cp',$classes.FullName,'app.katovpn.support.SupportPolicyTest')
+$testClasspath = $classes.FullName + ';' + ($dependencies -join ';')
+Invoke-BuildTool (Join-Path $bin 'java.exe') @('-cp',$testClasspath,'app.katovpn.support.SupportPolicyTest')
+$shellArgs = @('-cp',$testClasspath,'app.katovpn.support.SupportRouterLeaseTest')
+if ($TestShell) { $shellArgs += (Resolve-Path -LiteralPath $TestShell).Path }
+Invoke-BuildTool (Join-Path $bin 'java.exe') $shellArgs
+$sshArgs = @('-cp',$testClasspath,'app.katovpn.support.SupportRouterTransportTest')
+if ($TestPython) { $sshArgs += @((Resolve-Path -LiteralPath $TestPython).Path, (Join-Path $PSScriptRoot 'test/ssh_fixture.py')) }
+Invoke-BuildTool (Join-Path $bin 'java.exe') $sshArgs
 Invoke-BuildTool (Join-Path $tools 'aapt2.exe') @('link','-I',$platform,'--manifest',(Join-Path $PSScriptRoot 'AndroidManifest.xml'),'-A',$assets.FullName,'-o',$unsigned)
 $classFiles = @(Get-ChildItem -LiteralPath $classes.FullName -Recurse -Filter '*.class' -File |
     Where-Object Name -notlike '*Test*' | ForEach-Object FullName)
@@ -67,7 +76,7 @@ try {
 } finally { $archive.Dispose() }
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-$apk = Join-Path (Resolve-Path -LiteralPath $OutputDirectory).Path 'KatoVPN-Router-Support-v0.1.2-preview.apk'
+$apk = Join-Path (Resolve-Path -LiteralPath $OutputDirectory).Path 'KatoVPN-Router-Support-v0.1.3-preview.apk'
 Invoke-BuildTool (Join-Path $tools 'zipalign.exe') @('-f','4',$unsigned,$aligned)
 Invoke-BuildTool (Join-Path $tools 'apksigner.bat') @('sign','--ks',$Keystore,'--ks-key-alias','katovpn-support','--ks-pass','env:KATO_ANDROID_SIGN_PASSWORD','--out',$apk,$aligned)
 Invoke-BuildTool (Join-Path $tools 'apksigner.bat') @('verify','--verbose','--print-certs',$apk)

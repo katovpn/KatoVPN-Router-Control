@@ -19,22 +19,26 @@ public final class SupportPolicyTest {
         check(!SupportPolicy.validExpiry(100000, 100301, 103600));
         check(!SupportPolicy.validExpiry(100000, 99990, 103600));
         check(SupportPolicy.validExpiry(100000, 99990, 103590));
+        check(SupportPolicy.deadlineAt(5000, 100000750, 103600) == 3604250,
+            "the original UTC expiry maps to the captured monotonic clock without rounding forward");
         checkRecovery();
         System.out.println("Support policy tests passed");
     }
 
     private static void checkRecovery() throws InterruptedException {
         long[] now = {0};
-        check(SupportPolicy.recover(3600000, () -> now[0], () -> false, limit -> {
-            check(limit == 300000);
-            return now[0] >= 299000;
-        }, delay -> now[0] += delay));
-        check(now[0] == 299000);
+        check(SupportPolicy.recover(3600000, () -> now[0], () -> false,
+            limit -> now[0] >= 900000, delay -> now[0] += delay),
+            "the original lease can recover after fifteen minutes");
+        check(now[0] == 900000);
 
         now[0] = 0;
         check(!SupportPolicy.recover(3600000, () -> now[0], () -> false,
-            limit -> false, delay -> now[0] += delay));
-        check(now[0] == 300000);
+            limit -> {
+                check(limit == 3600000, "every attempt sees the original expiry");
+                return false;
+            }, delay -> now[0] += delay));
+        check(now[0] == 3600000);
 
         now[0] = 0;
         check(!SupportPolicy.recover(120000, () -> now[0], () -> false, limit -> {
@@ -52,6 +56,10 @@ public final class SupportPolicyTest {
     }
 
     private static void check(boolean condition) {
-        if (!condition) throw new AssertionError();
+        check(condition, "support policy assertion failed");
+    }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) throw new AssertionError(message);
     }
 }

@@ -9,6 +9,8 @@ import android.os.*;
 import android.text.InputType;
 import android.view.WindowManager;
 import android.widget.*;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Locale;
@@ -87,6 +89,7 @@ public final class MainActivity extends Activity {
         user = field(credentials, "Логин", "root", InputType.TYPE_CLASS_TEXT);
         password = field(credentials, "Пароль SSH", "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         password.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
+        password.setImeOptions(password.getImeOptions() | android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         start = button(credentials, "Войти на роутер", () -> {
             if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
                 requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
@@ -131,8 +134,14 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "Укажите локальный IPv4, порт, логин и пароль.", Toast.LENGTH_LONG).show();
             return;
         }
-        byte[] secret = password.getText().toString().getBytes(StandardCharsets.UTF_8);
-        password.getText().clear();
+        ByteBuffer encoded = StandardCharsets.UTF_8.encode(CharBuffer.wrap(password.getText()));
+        byte[] secret = new byte[encoded.remaining()];
+        try { encoded.get(secret); }
+        finally {
+            encoded.clear();
+            while (encoded.hasRemaining()) encoded.put((byte) 0);
+            password.getText().clear();
+        }
         getSystemService(android.view.inputmethod.InputMethodManager.class)
             .hideSoftInputFromWindow(password.getWindowToken(), 0);
         if (!SupportService.queue(new SupportService.Request(ip, login, sshPort, secret))) {
