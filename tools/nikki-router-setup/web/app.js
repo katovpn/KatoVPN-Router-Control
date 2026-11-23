@@ -7,6 +7,8 @@ const state = {
   browserSessionClosing: false,
   pollTimer: null,
   supportTimer: null,
+  supportPollTimer: null,
+  supportRevision: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -109,6 +111,8 @@ function setBusy(button, busy, label) {
 
 function showLogin() {
   window.clearInterval(state.supportTimer);
+  window.clearTimeout(state.supportPollTimer);
+  state.supportRevision += 1;
   state.routerSession = null;
   $("#app-view").classList.add("hidden");
   $("#login-view").classList.remove("hidden");
@@ -161,12 +165,15 @@ function formatSupportExpiry(epochSeconds) {
 }
 
 function renderSupport(support) {
+  state.supportRevision += 1;
   window.clearInterval(state.supportTimer);
+  window.clearTimeout(state.supportPollTimer);
   if (state.routerSession) state.routerSession.support = support;
   const active = support.status === "active";
+  const recovering = active && support.connection_state === "recovering";
   const available = support.available !== false && support.status !== "unavailable";
   const stateLabel = $("#support-state");
-  stateLabel.textContent = active ? "Подключён" : support.status === "starting" ? "Подключаем…" : available ? "Отключён" : "Недоступен";
+  stateLabel.textContent = recovering ? "Восстанавливаем…" : active ? "Подключён" : support.status === "starting" ? "Подключаем…" : support.status === "stopping" ? "Отключаем…" : available ? "Отключён" : "Недоступен";
   stateLabel.className = `label ${active ? "active" : available ? "" : "unavailable"}`;
   $("#support-idle").classList.toggle("hidden", active);
   $("#support-active").classList.toggle("hidden", !active);
@@ -174,8 +181,11 @@ function renderSupport(support) {
     ? "Приложение создаст исходящее защищённое подключение к закрытому серверу KatoVPN."
     : support.message || "Сервер временной поддержки ещё не подключён к этой сборке.";
   const startButton = $("#support-start-button");
-  startButton.disabled = !available || support.status === "starting";
+  startButton.disabled = !available || ["starting", "stopping"].includes(support.status);
 
+  if (["active", "starting", "stopping"].includes(support.status)) {
+    state.supportPollTimer = window.setTimeout(() => refreshSupportStatus({ quiet: true }), 5000);
+  }
   if (!active) return;
   $("#support-code").textContent = support.code || "—";
   $("#support-server").textContent = support.server || "—";
@@ -200,12 +210,19 @@ function renderSupport(support) {
   state.supportTimer = window.setInterval(updateCountdown, 1000);
 }
 
-async function refreshSupportStatus() {
+async function refreshSupportStatus({ quiet = false } = {}) {
+  const revision = state.supportRevision;
   try {
     const payload = await api("/api/support/status");
+    if (revision !== state.supportRevision || state.browserSessionClosing) return;
     renderSupport(payload.support || { status: "inactive", available: false });
   } catch (error) {
-    showError(error.message);
+    if (revision !== state.supportRevision || state.browserSessionClosing) return;
+    if (!quiet) showError(error.message);
+    if (!state.browserSessionClosing && ["active", "starting", "stopping"].includes(state.routerSession?.support?.status)) {
+      window.clearTimeout(state.supportPollTimer);
+      state.supportPollTimer = window.setTimeout(() => refreshSupportStatus({ quiet: true }), 5000);
+    }
   }
 }
 

@@ -146,6 +146,7 @@ def build_support_install_command(session_id: str, expires_at: int, *, repair: b
     upload = f"/tmp/kato-support-key-{session_id}" if repair else "/tmp/kato-support-key"
     delay = max(1, expires_at - int(time.time()))
     return (
+        f'test "$(date +%s)" -lt {expires_at} || exit 124; '
         f"mkdir -p {shlex.quote(support_dir)} /etc/dropbear /etc/crontabs; "
         f"chmod 700 {shlex.quote(SUPPORT_ROOT)} {shlex.quote(support_dir)}; "
         f"cat > {shlex.quote(session_shell)} <<'KATO_SUPPORT_SESSION'\n"
@@ -193,6 +194,7 @@ def build_support_install_command(session_id: str, expires_at: int, *, repair: b
         "exec /bin/ash -l\n"
         "KATO_SUPPORT_SESSION\n"
         f"chmod 700 {shlex.quote(session_shell)}; "
+        f'test "$(date +%s)" -lt {expires_at} || exit 124; '
         f"touch {shlex.quote(SUPPORT_AUTHORIZED_KEYS)} {shlex.quote(SUPPORT_CRONTAB)}; "
         f"chmod 600 {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
         f"sed -i '\\| {marker}$|d' {shlex.quote(SUPPORT_AUTHORIZED_KEYS)}; "
@@ -264,6 +266,8 @@ def install_temporary_support_key(
     *,
     session_factory: Callable[[ConnectionSpec], RemoteSession] = RemoteSession,
     repair: bool = False,
+    continue_check: Callable[[], bool] | None = None,
+    session_timeout_seconds: float = 30,
 ) -> None:
     session_id = _validate_support_session_id(session_id)
     public_key = validate_support_public_key(public_key)
@@ -271,10 +275,27 @@ def install_temporary_support_key(
     session = session_factory(spec)
     wrote_key = False
     upload = f"/tmp/kato-support-key-{session_id}" if repair else "/tmp/kato-support-key"
+    timed_out = threading.Event()
+    def abort_session() -> None:
+        timed_out.set()
+        try:
+            session.close()
+        except Exception:
+            pass
+    watchdog = threading.Timer(max(0, min(session_timeout_seconds, expires_at - time.time())), abort_session)
+    watchdog.daemon = True
+    def check_allowed() -> None:
+        if timed_out.is_set():
+            raise SetupError("support_router_timeout", "Роутер не ответил вовремя; подключение будет повторено.")
+        if time.time() >= expires_at or (continue_check is not None and not continue_check()):
+            raise SetupError("support_expired", "Временный доступ завершён; восстановление отменено.")
     try:
+        check_allowed()
+        watchdog.start()
         if repair or isinstance(session, RemoteSession):
             session.client.set_missing_host_key_policy(_PinnedRouterPolicy(expected_fingerprint))
         session.connect()
+        check_allowed()
         if not secrets.compare_digest(expected_fingerprint, session.fingerprint):
             raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Временный доступ не включён.")
         session_shell = f"{SUPPORT_ROOT}/{session_id}/session.sh"
@@ -293,6 +314,7 @@ def install_temporary_support_key(
                 f"&& grep -Fxq {cron_line} {SUPPORT_CRONTAB}; then echo present; else echo missing; fi",
                 label="проверка ключа после переподключения",
             )
+            check_allowed()
             if state.strip() == "present":
                 return
             if state.strip() != "missing" or time.time() >= expires_at:
@@ -312,6 +334,7 @@ def install_temporary_support_key(
             "printf 'now=%s\\n' \"$(date +%s 2>/dev/null || printf '0')\"",
             label="проверка временного доступа",
         )
+        check_allowed()
         required = ("uid=0", "dropbear=1", "cron=1", "cron_enabled=1", "daemon=1")
         capability_lines = set(capabilities.splitlines())
         missing_capabilities = [item.split("=", 1)[0] for item in required if item not in capability_lines]
@@ -326,10 +349,13 @@ def install_temporary_support_key(
             )
         clock_match = re.search(r"(?m)^now=(\d+)$", capabilities)
         router_now = int(clock_match.group(1)) if clock_match else 0
-        if abs(router_now - int(time.time())) > 300 or not router_now + 60 <= int(expires_at) <= router_now + SUPPORT_DURATION_SECONDS + 120:
+        minimum_remaining = 1 if repair else 60
+        if abs(router_now - int(time.time())) > 300 or not router_now + minimum_remaining <= int(expires_at) <= router_now + SUPPORT_DURATION_SECONDS + 120:
             raise SetupError("support_router_clock", "Время на роутере неверное, поэтому безопасный часовой таймер не может быть включён.")
         wrote_key = True
+        check_allowed()
         session.write_file(upload, authorized_key.encode("ascii"))
+        check_allowed()
         session.run(
             build_support_install_command(session_id, expires_at, repair=repair),
             label="временный ключ поддержки",
@@ -348,7 +374,10 @@ def install_temporary_support_key(
                 session.run(f"rm -f {upload}", label="очистка временного ключа", check=False)
             except Exception:
                 pass
-        session.close()
+        try:
+            session.close()
+        finally:
+            watchdog.cancel()
 
 
 def remove_temporary_support_key(
@@ -360,7 +389,10 @@ def remove_temporary_support_key(
 ) -> None:
     session_id = _validate_support_session_id(session_id)
     session = session_factory(spec)
+    watchdog = threading.Timer(30, session.close)
+    watchdog.daemon = True
     try:
+        watchdog.start()
         if isinstance(session, RemoteSession):
             session.client.set_missing_host_key_policy(_PinnedRouterPolicy(expected_fingerprint))
         session.connect()
@@ -368,7 +400,10 @@ def remove_temporary_support_key(
             raise SetupError("router_fingerprint_changed", "SSH-ключ роутера изменился. Временный ключ удалит таймер роутера.")
         session.run(build_support_remove_command(session_id), label="отключение временной поддержки", timeout=20)
     finally:
-        session.close()
+        try:
+            session.close()
+        finally:
+            watchdog.cancel()
 
 
 class SupportRelayApiClient:
@@ -434,6 +469,14 @@ class ReverseSshTunnel:
         self.router_spec = router_spec
         self.transport: paramiko.Transport | None = None
         self._lock = threading.Lock()
+        self._router_ready = threading.Event()
+        self._router_ready.set()
+
+    def set_router_ready(self, ready: bool) -> None:
+        if ready:
+            self._router_ready.set()
+        else:
+            self._router_ready.clear()
 
     def start(self) -> None:
         sock: socket.socket | None = None
@@ -479,8 +522,10 @@ class ReverseSshTunnel:
     def _forward_channel(self, channel: paramiko.Channel) -> None:
         target: socket.socket | None = None
         try:
+            if not self._router_ready.is_set():
+                return
             target = socket.create_connection((self.router_spec.host, self.router_spec.port), timeout=8)
-            while True:
+            while self._router_ready.is_set():
                 readable, _, _ = select.select([channel, target], [], [], 1.0)
                 if channel in readable:
                     data = channel.recv(32768)
@@ -535,8 +580,22 @@ class ReverseSshTunnel:
 
     def router_reachable(self) -> bool:
         try:
-            with socket.create_connection((self.router_spec.host, self.router_spec.port), timeout=2):
-                return True
+            with socket.create_connection((self.router_spec.host, self.router_spec.port), timeout=2) as target:
+                # A TCP accept is not proof that Dropbear can handle SSH.
+                deadline = time.monotonic() + 2
+                banner = b""
+                while len(banner) < 255:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    target.settimeout(remaining)
+                    data = target.recv(255 - len(banner))
+                    if not data:
+                        return False
+                    banner += data
+                    if b"\n" in banner:
+                        return banner.split(b"\n", 1)[0].startswith(b"SSH-2.0-")
+                return False
         except OSError:
             return False
 
@@ -601,8 +660,9 @@ class SupportSessionManager:
         self.tunnel_factory = tunnel_factory
         self.install_key = install_key
         self.repair_key = repair_key
+        self.default_repair = repair_key is None and install_key is install_temporary_support_key
         if repair_key is None and install_key is install_temporary_support_key:
-            self.repair_key = lambda *args: install_temporary_support_key(*args, repair=True)
+            self.repair_key = lambda *args, **kwargs: install_temporary_support_key(*args, repair=True, **kwargs)
         self.remove_key = remove_key
         self.timer_factory = timer_factory
         self.key_factory = key_factory
@@ -612,11 +672,15 @@ class SupportSessionManager:
         self.lock = threading.Lock()
         self.active: dict[str, Any] | None = None
         self.starting = False
+        self.stopping = False
+        self.start_cancel: threading.Event | None = None
+        self.last_stop_reason = ""
 
     def public_status(self) -> dict[str, Any]:
         with self.lock:
             active = self.active
             starting = self.starting
+            stopping = self.stopping
         if not self.config.enabled:
             return {
                 "status": "unavailable",
@@ -625,8 +689,11 @@ class SupportSessionManager:
             }
         if starting:
             return {"status": "starting", "available": True, "duration_seconds": SUPPORT_DURATION_SECONDS}
+        if stopping:
+            return {"status": "stopping", "available": True, "duration_seconds": SUPPORT_DURATION_SECONDS}
         if not active:
-            return {"status": "inactive", "available": True, "duration_seconds": SUPPORT_DURATION_SECONDS}
+            return {"status": "inactive", "available": True, "duration_seconds": SUPPORT_DURATION_SECONDS,
+                    "stop_reason": self.last_stop_reason}
         lease = active["lease"]
         return {
             "status": "active",
@@ -636,35 +703,49 @@ class SupportSessionManager:
             "port": lease["support_port"],
             "router_username": active["router_username"],
             "expires_at": lease["expires_at"],
+            "connection_state": active.get("connection_state", "connected"),
+            "last_error_code": active.get("last_error_code", ""),
+            "diagnostics": list(active.get("diagnostics", ())),
         }
 
     def start(self, spec: ConnectionSpec, fingerprint: str, *, router_username: str) -> dict[str, Any]:
         if not self.config.enabled:
             raise SetupError("support_relay_unavailable", "Сервер временной поддержки ещё не подключён к этой сборке.")
         with self.lock:
-            if self.active or self.starting:
+            if self.active or self.starting or self.stopping:
                 raise SetupError("support_already_active", "Временная поддержка уже включена.")
             self.starting = True
+            start_cancel = threading.Event()
+            self.start_cancel = start_cancel
 
         lease: dict[str, Any] | None = None
         tunnel: Tunnel | None = None
         key_installed = False
-        client_key = self.key_factory()
         try:
+            client_key = self.key_factory()
             public_key = f"{client_key.get_name()} {client_key.get_base64()} KatoVPN-Router-Control"
             raw_lease = self.relay_client.create_session(public_key, duration_seconds=SUPPORT_DURATION_SECONDS)
             lease = _normalize_lease(raw_lease, now=int(self.now()))
+            lease_deadline = time.monotonic() + min(SUPPORT_DURATION_SECONDS, lease["expires_at"] - self.now())
+            if start_cancel.is_set():
+                raise SetupError("support_cancelled", "Создание временного доступа отменено.")
             self.install_key(spec, fingerprint, lease["support_public_key"], lease["session_id"], lease["expires_at"])
             key_installed = True
+            if start_cancel.is_set():
+                raise SetupError("support_cancelled", "Создание временного доступа отменено.")
             tunnel = self.tunnel_factory(config=self.config, lease=lease, client_key=client_key, router_spec=spec)
             tunnel.start()
+            if self.now() >= lease["expires_at"] or time.monotonic() >= lease_deadline:
+                raise SetupError("support_expired", "Срок временного доступа истёк.")
             monitor_stop = threading.Event()
             timer = self.timer_factory(
-                max(1, lease["expires_at"] - self.now()),
+                max(0, min(lease["expires_at"] - self.now(), lease_deadline - time.monotonic())),
                 lambda: self.stop(reason="expired", expected_stop_event=monitor_stop),
             )
             timer.daemon = True
             with self.lock:
+                if start_cancel.is_set():
+                    raise SetupError("support_cancelled", "Создание временного доступа отменено.")
                 self.active = {
                     "lease": lease,
                     "tunnel": tunnel,
@@ -675,6 +756,10 @@ class SupportSessionManager:
                     "router_username": router_username,
                     "monitor_stop": monitor_stop,
                     "repair_lock": threading.Lock(),
+                    "deadline": lease_deadline,
+                    "connection_state": "connected",
+                    "last_error_code": "",
+                    "diagnostics": [],
                 }
                 self.starting = False
             timer.start()
@@ -715,17 +800,44 @@ class SupportSessionManager:
             raise SetupError("support_start_failed", "Не удалось безопасно включить временную поддержку.") from exc
         finally:
             with self.lock:
-                self.starting = False
+                if self.start_cancel is start_cancel:
+                    self.starting = False
+                    self.start_cancel = None
+
+    def _lease_alive(self, active: dict[str, Any], stop_event: threading.Event) -> bool:
+        return (not stop_event.is_set() and self.now() < active["lease"]["expires_at"]
+                and time.monotonic() < active["deadline"])
+
+    def _record_failure(self, active: dict[str, Any], stage: str, error: Exception | None = None) -> None:
+        # Store only allowlisted classifications in process memory. Exception
+        # messages may contain credentials, router data or remote stderr.
+        allowed = {"ssh_auth", "ssh_connect", "router_fingerprint_changed",
+                   "support_router_clock", "support_router_unsupported",
+                   "support_key_not_installed", "support_repair_unavailable",
+                   "support_relay_fingerprint", "support_relay_auth", "support_router_timeout"}
+        code = error.code if isinstance(error, SetupError) and error.code in allowed else stage
+        gate = getattr(active["tunnel"], "set_router_ready", None)
+        if gate is not None:
+            gate(False)
+        with self.lock:
+            if self.active is not active or active["monitor_stop"].is_set():
+                return
+            active["connection_state"] = "recovering"
+            active["last_error_code"] = code
+            events = active["diagnostics"]
+            if not events or events[-1]["code"] != code:
+                events.append({"stage": stage, "code": code})
+                del events[:-20]
 
     def _monitor_tunnel(self, session_id: str, stop_event: threading.Event) -> None:
         router_down_since = None
-        last_key_check = time.monotonic()
+        last_key_check = time.monotonic() - 30
         while not stop_event.wait(self.monitor_interval_seconds):
             with self.lock:
                 active = self.active
             if not active or active["lease"]["session_id"] != session_id or active["monitor_stop"] is not stop_event:
                 return
-            if self.now() >= active["lease"]["expires_at"]:
+            if not self._lease_alive(active, stop_event):
                 self.stop(reason="expired", expected_stop_event=stop_event)
                 return
             try:
@@ -733,9 +845,12 @@ class SupportSessionManager:
             except Exception:
                 tunnel_active = False
             if not tunnel_active:
+                self._record_failure(active, "relay_disconnected")
                 if not self._recover_tunnel(active, stop_event):
-                    self.stop(reason="relay_disconnected", expected_stop_event=stop_event)
+                    self.stop(reason="expired" if not self._lease_alive(active, stop_event) else "relay_disconnected",
+                              expected_stop_event=stop_event)
                     return
+                router_down_since = time.monotonic()
             if stop_event.is_set():
                 return
             # Keep the existing forward during a short router reboot. Each new
@@ -744,21 +859,32 @@ class SupportSessionManager:
                 router_reachable = active["tunnel"].router_reachable()
             except Exception:
                 router_reachable = False
+            if not router_reachable:
+                self._record_failure(active, "router_ssh_unavailable")
             if router_reachable:
                 if self.repair_key and (router_down_since is not None or time.monotonic() - last_key_check >= 30):
                     try:
                         with active["repair_lock"]:
-                            if stop_event.is_set() or self.now() >= active["lease"]["expires_at"]:
+                            if not self._lease_alive(active, stop_event):
                                 return
                             lease = active["lease"]
+                            options = {"continue_check": lambda: self._lease_alive(active, stop_event)} if self.default_repair else {}
                             self.repair_key(active["spec"], active["fingerprint"], lease["support_public_key"],
-                                            session_id, lease["expires_at"])
-                    except Exception:
+                                            session_id, lease["expires_at"], **options)
+                    except Exception as exc:
+                        self._record_failure(active, "router_repair_failed", exc)
                         router_reachable = False
                     else:
                         last_key_check = time.monotonic()
             if router_reachable:
                 router_down_since = None
+                with self.lock:
+                    if self.active is active and self._lease_alive(active, stop_event):
+                        gate = getattr(active["tunnel"], "set_router_ready", None)
+                        if gate is not None:
+                            gate(True)
+                        active["connection_state"] = "connected"
+                        active["last_error_code"] = ""
             elif router_down_since is None:
                 router_down_since = time.monotonic()
             elif time.monotonic() - router_down_since >= self.recovery_window_seconds:
@@ -767,42 +893,48 @@ class SupportSessionManager:
 
     def _recover_tunnel(self, active: dict[str, Any], stop_event: threading.Event) -> bool:
         lease = active["lease"]
-        retry_until = time.monotonic() + self.recovery_window_seconds
+        retry_until = min(active["deadline"], time.monotonic() + self.recovery_window_seconds)
         try:
             active["tunnel"].close()
         except Exception:
-            return False
-        while not stop_event.is_set() and self.now() < lease["expires_at"] and time.monotonic() < retry_until:
+            self._record_failure(active, "relay_close_failed")
+        while self._lease_alive(active, stop_event) and time.monotonic() < retry_until:
             replacement = None
             try:
                 replacement = self.tunnel_factory(
                     config=self.config, lease=lease, client_key=active["client_key"], router_spec=active["spec"],
                 )
+                gate = getattr(replacement, "set_router_ready", None)
+                if gate is not None:
+                    gate(False)
                 replacement.start()
                 with self.lock:
-                    if self.active is active and not stop_event.is_set() and self.now() < lease["expires_at"] and time.monotonic() < retry_until:
+                    if self.active is active and self._lease_alive(active, stop_event) and time.monotonic() < retry_until:
                         active["tunnel"] = replacement
                         return True
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_failure(active, "relay_reconnect_failed", exc)
             if replacement is not None:
                 try:
                     replacement.close()
                 except Exception:
-                    return False
+                    self._record_failure(active, "relay_close_failed")
             if stop_event.wait(min(self.monitor_interval_seconds, max(0, retry_until - time.monotonic()))):
                 return False
         return False
 
     def stop(self, *, reason: str = "manual", expected_stop_event: threading.Event | None = None) -> dict[str, Any]:
-        del reason
         with self.lock:
+            if expected_stop_event is None and self.start_cancel is not None:
+                self.start_cancel.set()
             active = self.active
             if active and expected_stop_event is not None and active["monitor_stop"] is not expected_stop_event:
                 active = None
             if active:
                 active["monitor_stop"].set()
                 self.active = None
+                self.last_stop_reason = reason
+                self.stopping = True
         if not active:
             return self.public_status()
         warnings: list[str] = []
@@ -823,6 +955,8 @@ class SupportSessionManager:
                 self.remove_key(active["spec"], active["fingerprint"], active["lease"]["session_id"])
         except Exception:
             warnings.append("Ключ удалит независимый таймер роутера не позднее окончания часа.")
+        with self.lock:
+            self.stopping = False
         result = self.public_status()
         if warnings:
             result["warnings"] = warnings
