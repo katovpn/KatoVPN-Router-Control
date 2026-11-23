@@ -49,7 +49,8 @@ $iconPath = Join-Path $ToolRoot 'web\logo.png'
     --noconfirm `
     --clean `
     --onefile `
-    --windowed `
+    --console `
+    --hide-console hide-early `
     --noupx `
     --name $ArtifactBase `
     --icon $iconPath `
@@ -66,6 +67,8 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $ExePath)) {
     throw "PyInstaller did not create $ArtifactBase.exe."
 }
 
+& $PythonExecutable (Join-Path $RepoRoot 'tools/tests/check_windows_loader.py') $ExePath
+if ($LASTEXITCODE -ne 0) { throw 'Windows bootloader import check failed.' }
 $smoke = Start-Process -FilePath $ExePath -ArgumentList '--smoke-test','--no-browser' -Wait -PassThru -WindowStyle Hidden
 if ($smoke.ExitCode -ne 0) { throw "Executable smoke test failed with exit code $($smoke.ExitCode)." }
 
